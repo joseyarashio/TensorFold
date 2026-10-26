@@ -19,6 +19,7 @@ const model = @import("model.zig");
 const round = @import("round.zig");
 const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
+const redraw = @import("redraw.zig");
 const link = @import("link.zig");
 const cuda = @import("cuda");
 
@@ -348,6 +349,7 @@ pub const Lanes = struct {
     next_snap: u64 = 1,
     fill: ?Fill = null, // the prompt pass that runs in pieces between rounds, from its next chunk
     paused: ?Fill = null, // the pass a short prompt cut into (lanes' cut_in), resumed by its next piece
+    rows: redraw.Rows = .{}, // the logits rows a redraw may read (structured output)
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -382,6 +384,7 @@ pub const Lanes = struct {
             .keep = keepFn,
             .draft = draftFn,
             .probabilities = probabilitiesFn,
+            .redraw = redrawFn,
             .release = releaseFn,
         } };
     }
@@ -461,6 +464,7 @@ pub const Lanes = struct {
 
     fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize) !bool {
         const m = self.m;
+        self.rows = .{};
         const t0 = m.now();
         defer if (self.prof) |*p| {
             p.prefill += m.now() - t0;
@@ -513,6 +517,7 @@ pub const Lanes = struct {
         }
         const token = try draw(logits, done.len, s.sampling);
         self.streams.getPtr(s).?.first = self.take(token);
+        self.rows.prompt = s;
         return true;
     }
 
@@ -702,6 +707,16 @@ pub const Lanes = struct {
         return error.NotPipelined;
     }
 
+    /// A row drawn again among the tokens its grammar allows, from the logits the last verify or prompt pass left.
+    fn redrawFn(ptr: *anyopaque, r: be.Redraw, allow: be.Allow) anyerror!?u32 {
+        const self = of(ptr);
+        const m = self.m;
+        const V = m.vocab;
+        // after a greedy round its logits are still on the device: one row comes to the host
+        const row = if (try self.rows.at(self.built.wins[0..self.built.n], r)) |i| (if (self.rows.greedy) try m.rowLogitsHost(i) else m.logits[i * V ..][0..V]) else m.logits[0..V];
+        return redraw.draw(row, r.position, r.stream.sampling, allow);
+    }
+
     fn readFn(ptr: *anyopaque, handle: u64) anyerror!u32 {
         const self = of(ptr);
         if (handle >= self.next or self.next - handle > ring) return error.NoSuchToken;
@@ -714,6 +729,7 @@ pub const Lanes = struct {
         const self = of(ptr);
         const m = self.m;
         const gpa = self.gpa;
+        self.rows = .{};
         if (windows.len > max_streams) return error.WindowTooWide;
         var ids: [max_streams][max_rows]i32 = undefined;
         var wins: [max_streams]Win = undefined;
@@ -756,6 +772,8 @@ pub const Lanes = struct {
         }
         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
         const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
+        self.rows = .{ .count = windows.len, .greedy = greedy };
+        for (windows, 0..) |w, k| self.rows.streams[k] = w.stream;
         const t3 = m.now();
         defer if (self.prof) |*p| {
             p.send += t1 - t0;
@@ -793,6 +811,7 @@ pub const Lanes = struct {
         const m = self.m;
         const gpa = self.gpa;
         if (m.dr == null) return error.NoDraftHead;
+        self.rows = .{};
         const block = m.dr.?.n;
         var tokens: [max_streams]i64 = undefined;
         var q0: [max_streams]i64 = undefined;

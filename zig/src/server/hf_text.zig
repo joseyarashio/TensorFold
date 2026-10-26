@@ -4,6 +4,7 @@ const tokenizer = @import("tokenizer");
 const template = @import("template");
 const json = @import("json.zig");
 const model_text = @import("model_text.zig");
+const grammar = @import("engine_api").grammar;
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
@@ -202,11 +203,18 @@ pub const HfText = struct {
             .template_source = sourceFn,
             .special = specialFn,
             .mask = maskFn,
+            .vocab = tableFn,
         } };
     }
 
     fn maskFn(ctx: *anyopaque, a: Allocator, s: []const u8) Allocator.Error!?[]u8 {
         return self(ctx).tok.maskAdded(a, s);
+    }
+
+    /// Every id's bytes as the ByteLevel decoder joins them; error.UnsupportedDecoder for any other decoder.
+    fn tableFn(ctx: *anyopaque, a: Allocator, eos: []const u32) anyerror!grammar.Vocab {
+        const t = self(ctx);
+        return grammar.Vocab.build(a, t.tok.id_to_token.tokens.items.len, &t.tok, eos);
     }
 
     fn specialFn(ctx: *anyopaque, id: u32) bool {

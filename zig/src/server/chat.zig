@@ -215,7 +215,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         request.loop_stop = request.loop_guard and (srv.config.loop_stop or (flag(f, "loop_guard_stop") orelse false));
         if ((budget > 0 or request.loop_guard) and srv.think_close.len > 0) {
             if (budget > 0) request.think_budget = @intCast(@min(budget, std.math.maxInt(u32)));
-            request.think_close = srv.think_close;
+            request.think_close = srv.thinkClose(request.structure != null);
             request.think_end = srv.think_close_end;
         }
     }

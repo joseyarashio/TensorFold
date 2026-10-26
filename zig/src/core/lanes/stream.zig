@@ -7,6 +7,7 @@ const Proposer = @import("proposer.zig").Proposer;
 const Sampling = @import("sampling.zig").Sampling;
 const State = @import("depth.zig").State;
 const long_loop = @import("long_loop.zig");
+const structure = @import("structure.zig");
 
 pub const Reason = enum {
     none,
@@ -140,6 +141,7 @@ pub const Spec = struct {
     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
     reuse: Reuse = .{},
     images: []const Image = &.{}, // in prompt order; the caller's until the stream is released
+    structure: ?structure.Spec = null, // the grammar the reply keeps inside (structured output)
 };
 
 pub const Stream = struct {
@@ -173,6 +175,8 @@ pub const Stream = struct {
     cache_len: u64 = 0,
     finished: bool = false,
     reason: Reason = .none,
+    message: []const u8 = "", // why an `error` stream failed
+    structure: ?structure.State = null,
     rounds: u64 = 0,
     drafted: u64 = 0,
     accepted: u64 = 0,
@@ -220,6 +224,7 @@ pub const Stream = struct {
             .chunks = spec.chunks,
             .reuse = spec.reuse,
             .images = spec.images,
+            .structure = if (spec.structure) |st| structure.State.init(st) else null,
         };
         try s.context.appendSlice(gpa, spec.prompt);
         return s;
@@ -340,6 +345,12 @@ pub const Stream = struct {
         var landed: usize = 0;
         for (tokens) |t| {
             if (s.finished) break;
+            if (s.structure) |*st| {
+                if (!st.take(t)) {
+                    s.fail(structure.refused);
+                    break;
+                }
+            }
             try s.context.append(gpa, t);
             landed += 1;
             if (@as(i64, t) == s.think_end) s.think_open = false;
@@ -368,6 +379,13 @@ pub const Stream = struct {
             }
         }
         return landed;
+    }
+
+    /// Ends the stream with an error its request reports (`message` must outlive the stream).
+    pub fn fail(s: *Stream, message: []const u8) void {
+        s.finished = true;
+        s.reason = .@"error";
+        s.message = message;
     }
 
     fn stopped(s: *const Stream) bool {

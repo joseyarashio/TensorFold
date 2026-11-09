@@ -29,7 +29,7 @@ const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
 
 /// MultiDecoder's stream slots in the served lane (--parallel 4): the pool's streams.
-pub const max_streams = 16; // the most streams any stream setting (Model.streams) gives the pool
+pub const max_streams = 32; // the most streams any stream setting (Model.streams) gives the pool
 /// The served pool's streams when unset (--parallel 4); the four-node lane serves 16.
 pub const default_streams = 4;
 /// A pass's rows at most: every stream's block (four streams: 20). Past kernels.decode_rows() (16 rows: four streams) the MoE gate is a
@@ -44,7 +44,7 @@ pub const ring_extra = 16;
 pub const max_stages = 4;
 pub const max_block = 8;
 /// absorb_many's rows at most: every drafting stream's verify window (16 rows a round).
-pub const max_absorb = 48; // a round's drafting rows at most (round.max_rows)
+pub const max_absorb = 64; // a round's drafting rows at most (round.max_rows)
 
 /// DraftPool: one ring plane a stage, bf16 [slots * ring, head_dim]; slot s's rows [s * ring, (s + 1) * ring). Positions
 /// below `absorbed[s]` are in slot s's rings.

@@ -81,10 +81,10 @@ pub const Imprint = struct {
     }
 
     /// The longest learned state `prompt` resumes: its tokens a prefix, a row left, `starts` below it the prompt's own.
-    pub fn best(m: *const Imprint, prompt: []const u32, starts: []const u32, planned: bool, longer_than: u32) ?*const Meta {
+    pub fn best(m: *const Imprint, prompt: []const u32, starts: []const u32, planned: bool, longer_than: u32, tail: u32) ?*const Meta {
         var out: ?*const Meta = null;
         for (m.metas.items) |*x| {
-            if (x.at <= longer_than or x.tokens.len > prompt.len or x.at >= prompt.len) continue;
+            if (x.at <= longer_than or x.tokens.len > prompt.len or x.at >= prompt.len or @as(usize, x.at) + tail > prompt.len) continue;
             if (out != null and x.at <= out.?.at) continue;
             if (!std.mem.eql(u32, prompt[0..x.tokens.len], x.tokens)) continue;
             if (planned and !sameBelow(starts, x.starts, x.at)) continue;

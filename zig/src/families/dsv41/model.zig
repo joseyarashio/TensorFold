@@ -507,6 +507,81 @@ pub const Model = struct {
         }
     }
 
+    /// The exact bytes of Plane B (the compressed MLA KV planes) for `at` tokens on this rank: 890 bytes per token.
+    pub fn planeBBytes(at: usize) usize {
+        return at * 890;
+    }
+
+    /// Exports Plane B's compressed MLA rows [base, base + at) into host buffer `dst`.
+    pub fn exportExtent(m: *Model, base: usize, at: usize, dst: []u8) !void {
+        const c = m.eng.c;
+        const cs = &m.caches;
+        const d = m.ctx.d;
+        var off: usize = 0;
+        for (m.eng.w.layers, 0..) |lay, i| {
+            if (lay.comp_wkv == null) continue;
+            const r: usize = lay.ratio;
+            if (base % r != 0 or at % r != 0) return error.BadView;
+            const n = at / r;
+            const row_code = c.head_dim / 2;
+            const row_scale = c.head_dim / 16;
+            const b_code = n * row_code;
+            const b_scale = n * row_scale;
+
+            try d.check(d.api.cuMemcpyDtoHAsync_v2(dst.ptr + off, cs.comp_codes[i] + (base / r) * row_code, b_code, m.stream.handle), "cuMemcpyDtoHAsync");
+            off += b_code;
+            try d.check(d.api.cuMemcpyDtoHAsync_v2(dst.ptr + off, cs.comp_scales[i] + (base / r) * row_scale, b_scale, m.stream.handle), "cuMemcpyDtoHAsync");
+            off += b_scale;
+
+            if (lay.idx_wk != null) {
+                const row_idx_c = c.index_head_dim / 2;
+                const row_idx_s = c.index_head_dim / 32;
+                const b_idx_c = n * row_idx_c;
+                const b_idx_s = n * row_idx_s;
+                try d.check(d.api.cuMemcpyDtoHAsync_v2(dst.ptr + off, cs.idx_codes[i] + (base / r) * row_idx_c, b_idx_c, m.stream.handle), "cuMemcpyDtoHAsync");
+                off += b_idx_c;
+                try d.check(d.api.cuMemcpyDtoHAsync_v2(dst.ptr + off, cs.idx_scales[i] + (base / r) * row_idx_s, b_idx_s, m.stream.handle), "cuMemcpyDtoHAsync");
+                off += b_idx_s;
+            }
+        }
+        try m.stream.synchronize();
+    }
+
+    /// Imports Plane B's compressed MLA rows from host buffer `src` into device pool extent [base, base + at).
+    pub fn importExtent(m: *Model, base: usize, at: usize, src: []const u8) !void {
+        const c = m.eng.c;
+        const cs = &m.caches;
+        const d = m.ctx.d;
+        var off: usize = 0;
+        for (m.eng.w.layers, 0..) |lay, i| {
+            if (lay.comp_wkv == null) continue;
+            const r: usize = lay.ratio;
+            if (base % r != 0 or at % r != 0) return error.BadView;
+            const n = at / r;
+            const row_code = c.head_dim / 2;
+            const row_scale = c.head_dim / 16;
+            const b_code = n * row_code;
+            const b_scale = n * row_scale;
+
+            try d.check(d.api.cuMemcpyHtoDAsync_v2(cs.comp_codes[i] + (base / r) * row_code, src.ptr + off, b_code, m.stream.handle), "cuMemcpyHtoDAsync");
+            off += b_code;
+            try d.check(d.api.cuMemcpyHtoDAsync_v2(cs.comp_scales[i] + (base / r) * row_scale, src.ptr + off, b_scale, m.stream.handle), "cuMemcpyHtoDAsync");
+            off += b_scale;
+
+            if (lay.idx_wk != null) {
+                const row_idx_c = c.index_head_dim / 2;
+                const row_idx_s = c.index_head_dim / 32;
+                const b_idx_c = n * row_idx_c;
+                const b_idx_s = n * row_idx_s;
+                try d.check(d.api.cuMemcpyHtoDAsync_v2(cs.idx_codes[i] + (base / r) * row_idx_c, src.ptr + off, b_idx_c, m.stream.handle), "cuMemcpyHtoDAsync");
+                off += b_idx_c;
+                try d.check(d.api.cuMemcpyHtoDAsync_v2(cs.idx_scales[i] + (base / r) * row_idx_s, src.ptr + off, b_idx_s, m.stream.handle), "cuMemcpyHtoDAsync");
+                off += b_idx_s;
+            }
+        }
+        try m.stream.synchronize();
+    }
+
     fn copySpan(m: *Model, plane: u64, from: usize, to: usize, n: usize, row: usize) !void {
         const d = m.ctx.d;
         try d.check(d.api.cuMemcpyDtoDAsync_v2(plane + to * row, plane + from * row, n * row, m.stream.handle), "cuMemcpyDtoDAsync");

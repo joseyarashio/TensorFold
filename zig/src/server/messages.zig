@@ -328,6 +328,33 @@ fn place(cx: *Cx, out: *std.ArrayList(Value), instructions: *std.ArrayList(*json
     try out.append(cx.a, .{ .object = item });
 }
 
+/// The messages with no assistant turn carrying ``reasoning_content`` (``--drop-reasoning-history``): a client that
+/// replays each turn's reasoning (an agent harness in a tool loop; DeepSeek-V4.1's template keeps every turn's once tools
+/// are present) otherwise shows the model its own earlier thinking at every step, and a run of a few hundred thousand
+/// tokens drifted into ever flatter, then repeating reasoning. Messages without the field are returned as they are.
+pub fn dropReasoning(cx: *Cx, messages: Value, keep_last_n: u32) errors.Refused!Value {
+    if (messages != .array) return messages;
+    var total_with_reasoning: usize = 0;
+    for (messages.array) |m| if (m == .object and m.get("reasoning_content") != null) {
+        total_with_reasoning += 1;
+    };
+    if (total_with_reasoning <= keep_last_n) return messages;
+    const drop_count = total_with_reasoning - keep_last_n;
+    var dropped: usize = 0;
+    const out = try cx.a.alloc(Value, messages.array.len);
+    for (messages.array, 0..) |m, k| {
+        out[k] = m;
+        if (m != .object or m.get("reasoning_content") == null) continue;
+        if (dropped < drop_count) {
+            const copy = try json.copyObject(cx.a, m.object);
+            _ = copy.orderedRemove("reasoning_content");
+            out[k] = .{ .object = copy };
+            dropped += 1;
+        }
+    }
+    return .{ .array = out };
+}
+
 /// ``_normalize_tool_call_arguments``: call arguments as objects for templates; bad ones under ``_invalid_arguments``.
 pub fn toolArguments(cx: *Cx, messages: Value) errors.Refused!Value {
     if (messages != .array) return messages;

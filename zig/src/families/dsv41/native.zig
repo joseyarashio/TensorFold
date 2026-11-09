@@ -73,6 +73,10 @@ pub const Snaps = struct {
     save: *const fn (*anyopaque, ?*anyopaque, u32) anyerror!*anyopaque,
     restore: *const fn (*anyopaque, ?*anyopaque, *anyopaque) anyerror!void,
     drop: *const fn (*anyopaque, *anyopaque) void,
+    valid: ?*const fn (*anyopaque, *anyopaque) bool = null,
+    write: ?*const fn (*anyopaque, *anyopaque, [:0]const u8, u64) anyerror!void = null,
+    read: ?*const fn (*anyopaque, [:0]const u8, u64, u32) anyerror!*anyopaque = null,
+    forget: ?*const fn (*anyopaque, [:0]const u8, u64) void = null,
     /// Rows a resumed prompt pass must still run past a kept state (core/prompt_cache Rules.tail).
     tail: u32 = 0,
 };
@@ -157,7 +161,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     st.lanes.vision = st.vision;
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
-    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
+    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .valid = L.snapValidFn, .write = L.snapWriteFn, .read = L.snapReadFn, .forget = L.snapForgetFn, .tail = @intCast(st.m.cfg.window) };
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
 }
 
@@ -178,9 +182,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoRankCache => "set TF_DS_RANK_CACHE to the lane's per-rank weight files",
         error.NoKit => "set TF_DS_KIT to the kernel kit (cubins/, the RoPE tables, engram.json)",
         error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
-        error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
+        error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 64",
         error.BadGraphCap => "TF_DS_GRAPH_CAP: the captured CUDA graphs kept at most, a count (0: all)",
-        error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
+        error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 32",
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",

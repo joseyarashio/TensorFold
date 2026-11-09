@@ -370,7 +370,9 @@ pub fn decodeLaunches(ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride: 
     const i: usize = ex.width;
     const e: usize = ex.count;
     const slots = sc.slots;
-    if (r == 0 or r >= exact_rows or r > sc.rows) return error.NotADecodeWindow;
+    // a window holds up to exact_rows rows (the scratch's): the callers send chunks of fewer than exact_rows rows here
+    // (routed()), and a round of round.max_rows = exact_rows rows (4 member tiles, as 49..63; maxm <= 128 threads)
+    if (r == 0 or r > exact_rows or r > sc.rows) return error.NotADecodeWindow;
     // routed()'s gate of the fused path: GLM's tiles for gate / up (8 n tiles, 4 warps) and down (one split), 128-column
     // blocks, at most 32 slots; and every trellis 16-byte aligned (weights packs each at a multiple of 16 bytes)
     const cgu = try config(d, i, true);

@@ -27,6 +27,8 @@ pub const Snapshots = struct {
         trim: ?*const fn (ptr: *anyopaque, room: u64) void = null,
         /// Whether a save at `at` would take spare storage (no new storage).
         reuses: ?*const fn (ptr: *anyopaque, at: u32) bool = null,
+        /// Whether `saved` remains valid and unevicted on the backend device (null: always valid while kept).
+        valid: ?*const fn (ptr: *anyopaque, saved: Saved) bool = null,
         /// Write `saved` as learned state `key`, in files of the family's own under `dir` (null: nothing kept on disk).
         write: ?*const fn (ptr: *anyopaque, saved: Saved, dir: [:0]const u8, key: u64) anyerror!void = null,
         /// Learned state `key` of `at` tokens, read back from its files under `dir` into new storage.
@@ -123,9 +125,20 @@ pub const Store = struct {
     }
 
     /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row and `tail` left.
+    /// Invalidate and remove stale entries on the fly so they never shadow a disk state in `recall()`.
     pub fn find(s: *Store, prompt: []const u32, starts: []const u32) ?*Entry {
         var best: ?*Entry = null;
-        for (s.entries.items) |e| {
+        var i: usize = 0;
+        while (i < s.entries.items.len) {
+            const e = s.entries.items[i];
+            if (s.family.vtable.valid) |chk| {
+                if (!chk(s.family.ptr, e.saved)) {
+                    s.remove(i);
+                    s.counts.evicted += 1;
+                    continue;
+                }
+            }
+            i += 1;
             if (e.tokens.len > prompt.len or e.at >= prompt.len or @as(usize, e.at) + s.rules.tail > prompt.len or !s.usable(e.at, starts)) continue;
             if (best != null and e.at <= best.?.at) continue;
             const n = e.tokens.len;
@@ -255,7 +268,13 @@ pub const Store = struct {
         if (at == 0 or n > prompt.len) return false;
         s.clock += 1;
         const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
-        for (s.entries.items) |e| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n])) {
+        for (s.entries.items, 0..) |e, i| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n])) {
+            if (s.family.vtable.valid) |chk| {
+                if (!chk(s.family.ptr, e.saved)) {
+                    s.remove(i);
+                    break;
+                }
+            }
             e.used = s.clock; // the same state again: no copy
             e.shared = e.shared or shared;
             return true;
@@ -302,21 +321,36 @@ pub const Store = struct {
         };
         s.held += charged;
         s.counts.kept += 1;
-        if (shared) s.learn(e, starts);
+        // Subtlety B fix: persist all eligible long prefixes (>= 2048 tokens), including shared cuts,
+        // conversation histories, and large codebase prompts!
+        if (shared or at >= 2048) s.learn(e, starts);
         if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
         return true;
     }
 
     /// A shared cut's state written to disk once (--learn): later sessions read it back, after a restart too.
     fn learn(s: *Store, e: *const Entry, starts: []const u32) void {
-        const im = s.imprint orelse return;
-        const write = s.family.vtable.write orelse return;
+        const im = s.imprint orelse {
+            if (!@import("builtin").is_test) std.log.info("prompt cache: learn({d}) skipped (no imprint)", .{e.at});
+            return;
+        };
+        const write = s.family.vtable.write orelse {
+            if (!@import("builtin").is_test) std.log.info("prompt cache: learn({d}) skipped (no vtable.write)", .{e.at});
+            return;
+        };
         const key = imprint.Imprint.keyOf(e.tokens);
-        if (im.has(key) or e.bytes > im.cap) return;
+        if (im.has(key)) {
+            if (!@import("builtin").is_test) std.log.info("prompt cache: learn({d}) skipped (key {x:0>16} already on disk)", .{ e.at, key });
+            return;
+        }
+        if (e.bytes > im.cap) {
+            if (!@import("builtin").is_test) std.log.warn("prompt cache: learn({d}) skipped (bytes {d} > cap {d})", .{ e.at, e.bytes, im.cap });
+            return;
+        }
         while (!im.fits(e.bytes)) s.unlearn(im, im.victim() orelse return); // the least recently used go first
         write(s.family.ptr, e.saved, im.dir, key) catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
         im.add(key, e.at, e.tokens, starts, e.bytes) catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
-        if (!@import("builtin").is_test) std.log.info("prompt cache: learned {d} tokens to disk", .{e.at});
+        if (!@import("builtin").is_test) std.log.info("prompt cache: learned {d} tokens to disk ({s}/{x:0>16})", .{ e.at, im.dir, key });
     }
 
     /// Learned state `key` forgotten: its files (the family's), then its index record.
@@ -329,7 +363,7 @@ pub const Store = struct {
     fn recall(s: *Store, prompt: []const u32, starts: []const u32, have: ?*Entry) ?*Entry {
         const im = s.imprint orelse return have;
         const read = s.family.vtable.read orelse return have;
-        const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
+        const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0, s.rules.tail) orelse return have;
         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
         while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
             s.remove(s.victimBut(have, prompt) orelse return have);

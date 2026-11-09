@@ -57,7 +57,12 @@ pub const DeviceBuffer = struct {
     /// `len` bytes, 256-byte aligned by the driver; zero bytes allocate nothing and hold address 0.
     pub fn alloc(d: *const Driver, len: usize) Error!DeviceBuffer {
         var p: abi.DevicePtr = 0;
-        if (len > 0) try d.check(d.api.cuMemAlloc_v2(&p, len), "cuMemAlloc");
+        if (len > 0) {
+            d.check(d.api.cuMemAlloc_v2(&p, len), "cuMemAlloc") catch |err| {
+                std.debug.print("[DEBUG cuMemAlloc ERROR] len={d}, err={s}\n", .{ len, @errorName(err) });
+                return err;
+            };
+        }
         held(&device_bytes, len);
         return .{ .d = d, .ptr = p, .len = len };
     }

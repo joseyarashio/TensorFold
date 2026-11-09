@@ -68,10 +68,10 @@ test "learned states survive a reopen; the longest usable prefix wins" {
     try std.testing.expectEqual(@as(usize, 2), m.metas.items.len);
     try std.testing.expectEqual(@as(u64, 30), m.total());
     const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7 };
-    try std.testing.expectEqual(@as(u32, 4), m.best(&prompt, &.{ 1, 4, 6 }, true, 0).?.at);
-    try std.testing.expectEqual(@as(u32, 2), m.best(&prompt, &.{ 1, 2, 6 }, true, 0).?.at); // other starts below 4: only 2 fits
-    try std.testing.expect(m.best(&prompt, &.{ 1, 4, 6 }, true, 4) == null); // memory already holds 4
-    try std.testing.expect(m.best(&.{ 1, 2, 9, 9 }, &.{ 1, 2 }, true, 0) == null); // token 2 differs: 3 was read
+    try std.testing.expectEqual(@as(u32, 4), m.best(&prompt, &.{ 1, 4, 6 }, true, 0, 0).?.at);
+    try std.testing.expectEqual(@as(u32, 2), m.best(&prompt, &.{ 1, 2, 6 }, true, 0, 0).?.at); // other starts below 4: only 2 fits
+    try std.testing.expect(m.best(&prompt, &.{ 1, 4, 6 }, true, 4, 0) == null); // memory already holds 4
+    try std.testing.expect(m.best(&.{ 1, 2, 9, 9 }, &.{ 1, 2 }, true, 0, 0) == null); // token 2 differs: 3 was read
     var other = try Imprint.open(gpa, root, 8, 1 << 30); // another identity sees nothing
     defer other.deinit();
     try std.testing.expectEqual(@as(usize, 0), other.metas.items.len);

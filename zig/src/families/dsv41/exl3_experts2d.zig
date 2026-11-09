@@ -155,7 +155,7 @@ const Window = struct {
         const i: usize = ex.down_k;
         const ig: usize = ex.width;
         const dn: usize = ex.down_n;
-        if (r == 0 or r >= X.exact_rows or r > sc.rows) return error.NotADecodeWindow;
+        if (r == 0 or r > X.exact_rows or r > sc.rows) return error.NotADecodeWindow; // X.decodeLaunches: up to a 64-row round
         const cgu = try X.config(d, i, true);
         const cd = try X.config(i, d, false);
         if (cgu[0] != 8 or cgu[1] != 4 or cd[0] != 8 or cd[1] != 4 or cd[2] != 1) return error.UnsupportedShape;

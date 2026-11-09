@@ -53,6 +53,8 @@ pub const flags = [_]Flag{
     .{ .name = "--reasoning-effort", .choices = &.{ "low", "medium", "high", "xhigh" }, .native = true },
     .{ .name = "--thinking-budget", .native = true },
     .{ .name = "--loop-guard", .kind = .store_true, .native = true },
+    .{ .name = "--drop-reasoning-history", .kind = .store_true, .native = true },
+    .{ .name = "--keep-last-n-reasoning", .native = true },
     .{ .name = "--no-drafts", .kind = .store_true, .native = true },
     .{ .name = "--keep-warm", .native = true },
     .{ .name = "--compact-at", .native = true },
@@ -125,6 +127,10 @@ pub const Args = struct {
     reasoning_effort: ?[]const u8 = null,
     thinking_budget: i64 = 0,
     loop_guard: bool = false,
+    /// Earlier assistant turns render without their reasoning_content (the template then closes an empty think block).
+    drop_reasoning_history: bool = false,
+    /// Keep the most recent N assistant turns with reasoning_content, dropping earlier ones (default 0: drop all when enabled).
+    keep_last_n_reasoning: u32 = 0,
     no_drafts: bool = false,
     keep_warm: i64 = 900, // seconds the idle keepalive runs after the last request ends (0: off)
     compact_auto: bool = false,
@@ -223,7 +229,11 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
     } else if (is(name, "--learn-gib")) {
         out.learn = true;
         out.learn_gib = try gib(u, a, name, v);
-    } else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--keep-warm")) out.keep_warm = try int(u, a, name, v) else if (is(name, "--compact-at")) {
+    } else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--drop-reasoning-history")) out.drop_reasoning_history = true else if (is(name, "--keep-last-n-reasoning")) {
+        const n = try int(u, a, name, v);
+        out.keep_last_n_reasoning = @intCast(n);
+        out.drop_reasoning_history = true;
+    } else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--keep-warm")) out.keep_warm = try int(u, a, name, v) else if (is(name, "--compact-at")) {
         if (std.mem.eql(u8, v, "auto")) out.compact_auto = true else {
             const f = try float(u, a, name, v);
             if (!(f > 0 and f <= 1)) return fail(u, a, "argument --compact-at: expected auto or a fraction in (0, 1]: '{s}'", .{v});

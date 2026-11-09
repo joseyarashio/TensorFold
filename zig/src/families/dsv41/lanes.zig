@@ -37,7 +37,7 @@ pub const image_piece = 32 << 10;
 pub var logits_sha = false;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10 };
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10, snap_persist = 11, snap_load = 12, snap_forget = 13 };
 
 /// A frame being written.
 pub const Wire = struct {
@@ -274,6 +274,24 @@ const Lane = struct {
 
 extern "c" fn exp(x: f64) f64;
 
+pub const DSKV_MAGIC: u32 = 0x564b5344; // "DSKV"
+pub const DSKV_VERSION: u32 = 1;
+
+pub fn snapPath(buf: []u8, dir: []const u8, key: u64, rank: u32) ![:0]const u8 {
+    return std.fmt.bufPrintSentinel(buf, "{s}/{x:0>16}.r{d}.bin", .{ dir, key, rank }, 0);
+}
+
+pub fn makePath(gpa: std.mem.Allocator, dir: []const u8) void {
+    const tmp = gpa.dupeSentinel(u8, dir, 0) catch return;
+    defer gpa.free(tmp);
+    for (tmp[1..], 1..) |ch, i| if (ch == '/') {
+        tmp[i] = 0;
+        _ = std.c.mkdir(tmp.ptr, 0o700);
+        tmp[i] = '/';
+    };
+    _ = std.c.mkdir(tmp.ptr, 0o700);
+}
+
 /// A kept prompt state (the prompt cache's saved state, kept at a chunk end the prompt pass reached before its
 /// replay): the slot's own part on the device (Model.snapCopy), and the extent its compressed rows stay in,
 /// [base, base + at), held back from placement while it lives. Stale: a placement needed that room (its restore fails
@@ -284,6 +302,8 @@ pub const Snap = struct {
     base: usize,
     buf: cuda.DeviceBuffer,
     stale: bool = false,
+    staged_a: ?[]u8 = null, // Host staging buffer for Plane A until fillOpen
+    staged_b: ?[]u8 = null, // Host staging buffer for Plane B during NVMe recall until fillOpen places it
     wanted: u64 = 0, // when a request first waited for the live stream that holds these rows (placeKept; 0: none)
     end: usize = 0, // the extent end of the stream that kept it (placement holds [base, end) back while room allows)
 };
@@ -512,12 +532,16 @@ pub const Lanes = struct {
 
     /// A prompt pass's start: its slot and extent, its images, rank 1's fill and the kept state it resumes from.
     fn fillOpen(self: *Lanes, s: *lanes.Stream) !void {
+        try self.m.ctx.makeCurrent();
         const m = self.m;
         const gpa = self.gpa;
         const ids = s.prompt();
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
-        const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
+        const max_new: usize = @intCast(@min(s.max_new, m.pool_cap));
+        const needed = std.math.add(usize, len, max_new) catch m.pool_cap + 1;
+        const total_needed = std.math.add(usize, needed, m.eng.round_rows + 2) catch m.pool_cap + 1;
+        const size = std.mem.alignForward(usize, @min(total_needed, m.pool_cap + model.chunk_rows), model.chunk_rows);
         if (size > m.pool_cap) return error.PromptTooLong;
         if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
@@ -545,6 +569,8 @@ pub const Lanes = struct {
             } else s.reuse_failed = true;
         }
         const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
+        // placeKept may grow the source in place when a separate copy cannot fit.
+        if (kept) |sn| moved = base != sn.base;
         if (s.cut_in > 0) {
             const resume_at: usize = if (kept) |sn| (if (moved and sn.stale) 0 else sn.at) else 0;
             if (len - resume_at > s.cut_in or lanes.Engine.picturesPast(s.images, resume_at)) {
@@ -556,7 +582,7 @@ pub const Lanes = struct {
             sn.wanted = 0;
             if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held
         }
-        if (kept) |sn| if (moved and sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
+        if (kept) |sn| if (sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
             if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} found no room to move to ({d} positions); the prompt runs from 0", .{ sn.at, sn.base, size });
             kept = null;
             s.reuse_failed = true;
@@ -632,6 +658,20 @@ pub const Lanes = struct {
         const replay = len -| m.cfg.window;
         var start: usize = 0;
         if (kept) |sn| {
+            if (sn.staged_a) |staged_a_bytes| {
+                sn.buf = try cuda.DeviceBuffer.alloc(m.ctx.d, staged_a_bytes.len);
+                try m.ctx.d.check(m.ctx.d.api.cuMemcpyHtoD_v2(sn.buf.ptr, staged_a_bytes.ptr, staged_a_bytes.len), "cuMemcpyHtoD");
+                gpa.free(staged_a_bytes);
+                sn.staged_a = null;
+            }
+            if (sn.staged_b) |staged| {
+                try m.importExtent(base, sn.at, staged);
+                gpa.free(staged);
+                sn.staged_b = null;
+                sn.base = base;
+            } else if (base != sn.base) {
+                try m.copyExtent(sn.base, base, sn.at);
+            }
             if (try self.begin(.snap_restore)) {
                 try self.wire.int(gpa, u64, sn.id);
                 try self.wire.int(gpa, u32, @intCast(slot));
@@ -640,7 +680,6 @@ pub const Lanes = struct {
                 try self.wire.int(gpa, u64, sn.at);
                 try self.flush();
             }
-            if (base != sn.base) try m.copyExtent(sn.base, base, sn.at);
             try m.snapCopy(slot, sn.buf.ptr, false);
             start = sn.at;
             s.cached = @intCast(sn.at);
@@ -779,15 +818,23 @@ pub const Lanes = struct {
             n += 1;
         }
         if (n == 0) return;
-        if (try self.begin(.pass)) {
-            try self.wire.int(gpa, u32, @intCast(n));
-            try self.wire.int(gpa, u32, @intCast(steps));
-            for (0..n) |i| {
-                try self.wire.int(gpa, i64, tokens[i]);
-                try self.wire.int(gpa, i64, q0[i]);
-                try self.wire.int(gpa, i64, slots[i]);
+        // a pass runs block rows a stream through the decode window's linears (prompt.grouped: 128 rows at most), so
+        // more streams than 128 / block (25 at the 5-row block) draft in passes of that many, each its own wire message
+        const pass_rows = 128;
+        const per = @max(1, pass_rows / block);
+        var g0: usize = 0;
+        while (g0 < n) : (g0 += per) {
+            const g1 = @min(n, g0 + per);
+            if (try self.begin(.pass)) {
+                try self.wire.int(gpa, u32, @intCast(g1 - g0));
+                try self.wire.int(gpa, u32, @intCast(steps));
+                for (g0..g1) |i| {
+                    try self.wire.int(gpa, i64, tokens[i]);
+                    try self.wire.int(gpa, i64, q0[i]);
+                    try self.wire.int(gpa, i64, slots[i]);
+                }
+                try self.flush();
             }
-            try self.flush();
         }
         const t0 = m.now();
         try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps);
@@ -836,7 +883,8 @@ pub const Lanes = struct {
     /// the copy needs another state's room or would leave none for another request of its size: a copy that fills the
     /// pool makes the next prompt evict a kept state (the 5 x 500K check with the duplicate admitted fourth). Kept
     /// states hold their stream's whole extent back while a placement still fits so (placeSoft): its tail stays free
-    /// for the resume in place, which then stales nothing.
+    /// for the resume in place, which then stales nothing. If a separate copy cannot fit but the source can grow
+    /// in place clear of live streams and loading restores, only the kept rows in its new tail give way.
     fn placeKept(self: *Lanes, live: []const [2]usize, size: usize, source: ?*Snap) !usize {
         const gpa = self.gpa;
         var kept: std.ArrayList([3]usize) = .empty;
@@ -858,12 +906,27 @@ pub const Lanes = struct {
                 return if (try roomAfter(gpa, rows.items, b, size, self.m.pool_cap)) b else error.ContextFull;
             }
             if (got) |b| return b;
+            // A restored point may hold only its prefix's rows, with another idle
+            // state in the waiting request's tail. A disjoint copy needs room for
+            // BOTH the source and the whole request: impossible past half a pool.
+            // Prefer a copy while it fits (shared-prefix forks keep their later
+            // marks); under pressure grow here, retiring only the overwritten
+            // tail. Never overwrite a live stream or an in-flight restore.
+            if (source) |sn| if (self.canGrowHere(live, size, sn)) {
+                self.staleOver(sn.base + sn.at, sn.base + size, sn);
+                return sn.base;
+            };
             const victim = for (self.snaps.items) |sn| {
                 if (!sn.stale and sn != source and !clashes(live, sn.base, sn.base + sn.at)) break sn;
             } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
             noteStale(victim, "a placement needed its room (oldest first)");
             victim.stale = true;
         }
+    }
+
+    fn canGrowHere(self: *const Lanes, live: []const [2]usize, size: usize, source: *const Snap) bool {
+        if (source.stale or source.base + size > self.m.pool_cap or clashes(live, source.base, source.base + size)) return false;
+        return true;
     }
 
     /// Whether a kept state other than `except` and its shorter siblings has rows in [lo, hi); a longer one may be another conversation's.
@@ -888,6 +951,13 @@ pub const Lanes = struct {
     }
 
     /// The prompt cache's Snapshots functions (native.zig hands them to the CUDA host).
+    pub fn snapValidFn(ptr: *anyopaque, saved: *anyopaque) bool {
+        const self = of(ptr);
+        const sn: *Snap = @ptrCast(@alignCast(saved));
+        if (std.mem.indexOfScalar(*Snap, self.snaps.items, sn) == null) return false;
+        return !sn.stale;
+    }
+
     pub fn snapBytesFn(ptr: *anyopaque, at: u32) u64 {
         _ = at;
         return of(ptr).m.snapBytes();
@@ -927,8 +997,141 @@ pub const Lanes = struct {
             self.wire.int(self.gpa, u64, sn.id) catch {};
             self.flush() catch |err| std.log.err("dsv41: rank 1 kept a dropped prompt state: {s}", .{@errorName(err)});
         }
-        sn.buf.free();
+        if (sn.staged_a) |a| self.gpa.free(a);
+        if (sn.staged_b) |b| self.gpa.free(b);
+        if (sn.staged_a == null) sn.buf.free();
         self.gpa.destroy(sn);
+    }
+
+    /// Write both Plane A and Plane B into local NVMe binary file <dir>/<key>.r0.bin and instruct Rank 1 to write .r1.bin.
+    pub fn snapWriteFn(ptr: *anyopaque, saved: *anyopaque, dir: [:0]const u8, key: u64) anyerror!void {
+        const self = of(ptr);
+        const sn: *Snap = @ptrCast(@alignCast(saved));
+        if (sn.stale) return error.SnapshotStale;
+        try self.m.ctx.makeCurrent();
+
+        // 1. Tell Rank 1 to write its local NVMe half
+        if (try self.begin(.snap_persist)) {
+            try self.wire.int(self.gpa, u64, sn.id);
+            try self.wire.int(self.gpa, u64, key);
+            try self.wire.int(self.gpa, u32, @intCast(sn.at));
+            try self.wire.int(self.gpa, u64, sn.base);
+            try self.wire.int(self.gpa, u32, @intCast(dir.len));
+            try self.wire.buf.appendSlice(self.gpa, dir);
+            try self.flush();
+        }
+
+        // 2. Write Rank 0's local NVMe file
+        const a_bytes = self.m.snapBytes();
+        const b_bytes = model.Model.planeBBytes(sn.at);
+        const host_b = try self.gpa.alloc(u8, b_bytes);
+        defer self.gpa.free(host_b);
+        try self.m.exportExtent(sn.base, sn.at, host_b);
+
+        const host_a = try self.gpa.alloc(u8, a_bytes);
+        defer self.gpa.free(host_a);
+        try self.m.ctx.d.check(self.m.ctx.d.api.cuMemcpyDtoH_v2(host_a.ptr, sn.buf.ptr, a_bytes), "cuMemcpyDtoH");
+
+        var p_buf: [1100]u8 = undefined;
+        const final_file = try snapPath(&p_buf, dir, key, 0);
+        var tmp_buf: [1100]u8 = undefined;
+        const tmp_file = try std.fmt.bufPrintSentinel(&tmp_buf, "{s}.part", .{final_file}, 0);
+
+        const fd = std.c.open(tmp_file, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        if (fd < 0) return error.SnapshotWrite;
+        errdefer _ = std.c.unlink(tmp_file);
+        {
+            defer _ = std.c.close(fd);
+            var header: [1024]u32 = @splat(0);
+            header[0] = DSKV_MAGIC;
+            header[1] = DSKV_VERSION;
+            header[2] = @truncate(key);
+            header[3] = @truncate(key >> 32);
+            header[4] = @intCast(sn.at);
+            header[5] = @truncate(a_bytes);
+            header[6] = @truncate(b_bytes);
+            var n = std.c.write(fd, std.mem.sliceAsBytes(&header).ptr, 4096);
+            if (n != 4096) return error.SnapshotWrite;
+            n = std.c.write(fd, host_a.ptr, host_a.len);
+            if (n != host_a.len) return error.SnapshotWrite;
+            n = std.c.write(fd, host_b.ptr, host_b.len);
+            if (n != host_b.len) return error.SnapshotWrite;
+            if (std.c.fsync(fd) != 0) return error.SnapshotWrite;
+        }
+        if (std.c.rename(tmp_file, final_file) != 0) return error.SnapshotWrite;
+    }
+
+    /// Read learned state `key` from local NVMe into a HostStaged Snap (Plane A into DeviceBuffer, Plane B into staged host buffer).
+    pub fn snapReadFn(ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32) anyerror!*anyopaque {
+        const self = of(ptr);
+        self.m.ctx.makeCurrent() catch |err| {
+            std.debug.print("[snapReadFn] cuCtxSetCurrent failed: {s}, handle={?*}\n", .{ @errorName(err), self.m.ctx.handle });
+            return err;
+        };
+        const a_bytes = self.m.snapBytes();
+        const b_bytes = model.Model.planeBBytes(at);
+
+        var p_buf: [1100]u8 = undefined;
+        const file = try snapPath(&p_buf, dir, key, 0);
+        const fd = std.c.open(file, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) return error.SnapshotRead;
+        defer _ = std.c.close(fd);
+
+        var header: [1024]u32 = undefined;
+        var n = std.c.pread(fd, std.mem.sliceAsBytes(&header).ptr, 4096, 0);
+        if (n != 4096 or header[0] != DSKV_MAGIC or header[1] != DSKV_VERSION or header[4] != at) return error.SnapshotRead;
+
+        const staged_b = try self.gpa.alloc(u8, b_bytes);
+        errdefer self.gpa.free(staged_b);
+
+        const host_a = try self.gpa.alloc(u8, a_bytes);
+        defer self.gpa.free(host_a);
+
+        n = std.c.pread(fd, host_a.ptr, a_bytes, 4096);
+        if (n != a_bytes) return error.SnapshotRead;
+        n = std.c.pread(fd, staged_b.ptr, b_bytes, @intCast(4096 + a_bytes));
+        if (n != b_bytes) return error.SnapshotRead;
+
+        const host_a_dupe = try self.gpa.dupe(u8, host_a);
+        errdefer self.gpa.free(host_a_dupe);
+
+        const sn = try self.gpa.create(Snap);
+        errdefer self.gpa.destroy(sn);
+        sn.* = .{
+            .id = self.next_snap,
+            .at = at,
+            .base = 0,
+            .end = 0,
+            .buf = undefined,
+            .staged_a = host_a_dupe,
+            .staged_b = staged_b,
+        };
+        try self.snaps.append(self.gpa, sn);
+        self.next_snap += 1;
+
+        // Tell Rank 1 to load its half into its matching snap id
+        if (try self.begin(.snap_load)) {
+            try self.wire.int(self.gpa, u64, sn.id);
+            try self.wire.int(self.gpa, u64, key);
+            try self.wire.int(self.gpa, u32, at);
+            try self.wire.int(self.gpa, u64, sn.base);
+            try self.wire.int(self.gpa, u32, @intCast(dir.len));
+            try self.wire.buf.appendSlice(self.gpa, dir);
+            try self.flush();
+        }
+        return sn;
+    }
+
+    pub fn snapForgetFn(ptr: *anyopaque, dir: [:0]const u8, key: u64) void {
+        const self = of(ptr);
+        if (self.begin(.snap_forget) catch false) {
+            self.wire.int(self.gpa, u64, key) catch {};
+            self.wire.int(self.gpa, u32, @intCast(dir.len)) catch {};
+            self.wire.buf.appendSlice(self.gpa, dir) catch {};
+            self.flush() catch {};
+        }
+        var p_buf: [1100]u8 = undefined;
+        _ = std.c.unlink(snapPath(&p_buf, dir, key, 0) catch return);
     }
 
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
@@ -999,12 +1202,15 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             8 => .fill_images,
             9 => .done,
             10 => .fill_resume,
+            11 => .snap_persist,
+            12 => .snap_load,
+            13 => .snap_forget,
             else => return error.BadFrame,
         };
         if (try r.int(u64) != step) return error.OutOfStep;
         step += 1;
         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
-        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images) {
+        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images and kind != .snap_persist and kind != .snap_load and kind != .snap_forget) {
             m.joinAhead();
             m.fill_seq = &.{};
         }
@@ -1109,15 +1315,105 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const to: usize = @intCast(try r.int(u64));
                 const at: usize = @intCast(try r.int(u64));
                 const b = kept.get(id) orelse return error.UnknownSnapshot; // rank 0 restores only states both ranks keep
-                if (from != to) m.copyExtent(from, to, at) catch |err| refused(err);
-                m.snapCopy(s, b.ptr, false) catch |err| refused(err);
+                if (from != to and b.ptr != 0) m.copyExtent(from, to, at) catch |err| refused(err);
+                if (b.ptr != 0) m.snapCopy(s, b.ptr, false) catch |err| refused(err);
             },
             .snap_drop => {
                 const id = try r.int(u64);
                 if (kept.fetchRemove(id)) |kv| {
                     var b = kv.value;
-                    b.free();
+                    if (b.ptr != 0) b.free();
                 }
+            },
+            .snap_persist => {
+                const id = try r.int(u64);
+                const key = try r.int(u64);
+                const at = try r.int(u32);
+                const base: usize = @intCast(try r.int(u64));
+                const dir_len = try r.int(u32);
+                const dir = r.rest()[0..dir_len];
+                m.ctx.makeCurrent() catch continue;
+                makePath(gpa, dir);
+                std.debug.print("[rank1-debug] snap_persist received: id={d}, key={x:0>16}, at={d}, base={d}, dir={s}\n", .{ id, key, at, base, dir });
+                if (kept.get(id)) |buf_dev| {
+                    std.debug.print("[rank1-debug] kept.get({d}) found, writing .r1.bin\n", .{id});
+                    var p_buf: [1100]u8 = undefined;
+                    const final_file = snapPath(&p_buf, dir, key, 1) catch continue;
+                    var tmp_buf: [1100]u8 = undefined;
+                    const tmp_file = std.fmt.bufPrintSentinel(&tmp_buf, "{s}.part", .{final_file}, 0) catch continue;
+
+                    const a_bytes = m.snapBytes();
+                    const b_bytes = model.Model.planeBBytes(at);
+                    const host_b = gpa.alloc(u8, b_bytes) catch continue;
+                    defer gpa.free(host_b);
+                    m.exportExtent(base, at, host_b) catch continue;
+
+                    const host_a = gpa.alloc(u8, a_bytes) catch continue;
+                    defer gpa.free(host_a);
+                    m.ctx.d.check(m.ctx.d.api.cuMemcpyDtoH_v2(host_a.ptr, buf_dev.ptr, a_bytes), "cuMemcpyDtoH") catch continue;
+
+                    const fd = std.c.open(tmp_file, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+                    if (fd >= 0) {
+                        defer _ = std.c.close(fd);
+                        var header: [1024]u32 = @splat(0);
+                        header[0] = DSKV_MAGIC;
+                        header[1] = DSKV_VERSION;
+                        header[2] = @truncate(key);
+                        header[3] = @truncate(key >> 32);
+                        header[4] = at;
+                        header[5] = @truncate(a_bytes);
+                        header[6] = @truncate(b_bytes);
+                        _ = std.c.write(fd, std.mem.sliceAsBytes(&header).ptr, 4096);
+                        _ = std.c.write(fd, host_a.ptr, host_a.len);
+                        _ = std.c.write(fd, host_b.ptr, host_b.len);
+                        _ = std.c.fsync(fd);
+                        _ = std.c.rename(tmp_file, final_file);
+                    }
+                }
+            },
+            .snap_load => {
+                const id = try r.int(u64);
+                const key = try r.int(u64);
+                const at = try r.int(u32);
+                const base: usize = @intCast(try r.int(u64));
+                const dir_len = try r.int(u32);
+                const dir = r.rest()[0..dir_len];
+                m.ctx.makeCurrent() catch continue;
+
+                var p_buf: [1100]u8 = undefined;
+                const file = snapPath(&p_buf, dir, key, 1) catch continue;
+                const fd = std.c.open(file, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+                if (fd >= 0) {
+                    defer _ = std.c.close(fd);
+                    const a_bytes = m.snapBytes();
+                    const b_bytes = model.Model.planeBBytes(at);
+                    var header: [1024]u32 = undefined;
+                    var n = std.c.pread(fd, std.mem.sliceAsBytes(&header).ptr, 4096, 0);
+                    if (n == 4096 and header[0] == DSKV_MAGIC and header[1] == DSKV_VERSION and header[4] == at) {
+                        const host_a = gpa.alloc(u8, a_bytes) catch continue;
+                        defer gpa.free(host_a);
+                        const host_b = gpa.alloc(u8, b_bytes) catch continue;
+                        defer gpa.free(host_b);
+
+                        n = std.c.pread(fd, host_a.ptr, a_bytes, 4096);
+                        const n_b = std.c.pread(fd, host_b.ptr, b_bytes, @intCast(4096 + a_bytes));
+                        if (n == a_bytes and n_b == b_bytes) {
+                            m.ctx.makeCurrent() catch continue;
+                            const sn_b = cuda.DeviceBuffer{ .d = m.ctx.d, .ptr = 0, .len = 0 };
+                            m.importExtent(base, at, host_b) catch continue;
+                            kept.put(gpa, id, sn_b) catch continue;
+                        }
+                    }
+                }
+            },
+            .snap_forget => {
+                const key = try r.int(u64);
+                const dir_len = try r.int(u32);
+                const dir = r.rest()[0..dir_len];
+                var p_buf: [1100]u8 = undefined;
+                if (snapPath(&p_buf, dir, key, 1)) |f| {
+                    _ = std.c.unlink(f);
+                } else |_| {}
             },
             .done => return,
         }

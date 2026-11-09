@@ -138,6 +138,7 @@ const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque,
 
 /// The context a lane thread needs current: the lane host steps rounds on its own thread, CUDA binds per thread.
 threadlocal var bound: ?*const cuda.Context = null;
+var active_gpu_ctx: ?*const cuda.Context = null;
 
 const Gpu = struct { driver: cuda.Driver, ctx: cuda.Context };
 
@@ -156,15 +157,18 @@ const Host = struct {
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
+    learned: ?api.prompt_imprint.Imprint = null, // --learn: shared prompt states on disk
     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
+        active_host = null;
         h.host.stop();
         h.core.deinit();
         h.cfg.deinit(h.gpa);
         if (h.gpu) |g| g.ctx.makeCurrent() catch {};
         if (h.cache) |*store| store.deinit(); // the family's kept states go before the family
+        if (h.learned) |*m| m.deinit();
         h.release(h.family);
         if (h.gpu) |g| {
             g.ctx.deinit();
@@ -347,6 +351,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     g.ctx = try cuda.Context.init(&g.driver, @intCast(device));
     defer if (!opened) g.ctx.deinit();
     bound = &g.ctx;
+    active_gpu_ctx = &g.ctx;
     const capability = try g.ctx.capability();
     var name_buf: [256]u8 = undefined;
     const name = g.ctx.name(&name_buf) catch "GPU";
@@ -380,6 +385,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
+    active_host = h;
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
     h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}", .{
         capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
@@ -389,8 +395,34 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
         if (want > 0) {
-            h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
-            h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{ .tail = if (@hasField(@TypeOf(sn), "tail")) sn.tail else 0 }, want);
+            raw_snap_write = if (@hasField(@TypeOf(sn), "write")) sn.write else null;
+            raw_snap_read = if (@hasField(@TypeOf(sn), "read")) sn.read else null;
+            h.snap_vt = .{
+                .bytes = sn.bytes,
+                .save = sn.save,
+                .restore = sn.restore,
+                .drop = sn.drop,
+                .valid = if (@hasField(@TypeOf(sn), "valid")) sn.valid else null,
+                .write = if (raw_snap_write != null) wrapSnapWrite else null,
+                .read = if (raw_snap_read != null) wrapSnapRead else null,
+                .forget = if (@hasField(@TypeOf(sn), "forget")) sn.forget else null,
+            };
+            h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{ .tail = if (@hasField(@TypeOf(sn), "tail")) sn.tail else 0, .min_prompt = 2048 }, want);
+            if (o.learn) |root| {
+                const im_cap: u64 = @intFromFloat(o.learn_gib * (1 << 30));
+                std.debug.print("[dsv41-debug] o.learn detected: root={s}, im_cap={d}\n", .{ root, im_cap });
+                var im = api.prompt_imprint.Imprint.open(gpa, root, 0x564b5344, im_cap) catch |err| blk: {
+                    std.debug.print("[dsv41-debug] Imprint.open on {s} failed: {s}\n", .{ root, @errorName(err) });
+                    break :blk null;
+                };
+                if (im) |*m| {
+                    h.learned = m.*;
+                    h.cache.?.imprint = &h.learned.?;
+                    std.debug.print("[dsv41-debug] Imprint successfully bound to cache: dir={s}, metas={d}\n", .{ m.dir, m.metas.items.len });
+                }
+            } else {
+                std.debug.print("[dsv41-debug] o.learn is null in cuda.zig!\n", .{});
+            }
         }
     };
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
@@ -413,6 +445,27 @@ fn familyEfforts(comptime F: type) []const api.Effort {
 
 fn toGib(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / gib;
+}
+
+var raw_snap_read: ?*const fn (*anyopaque, [:0]const u8, u64, u32) anyerror!*anyopaque = null;
+var raw_snap_write: ?*const fn (*anyopaque, *anyopaque, [:0]const u8, u64) anyerror!void = null;
+
+var active_host: ?*Host = null;
+
+fn wrapSnapRead(ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32) anyerror!api.prompt_cache.Saved {
+    if (active_host) |h| {
+        if (h.gpu) |g| g.ctx.makeCurrent() catch {};
+    }
+    const sn_read = raw_snap_read orelse return error.NoSnapRead;
+    return sn_read(ptr, dir, key, at);
+}
+
+fn wrapSnapWrite(ptr: *anyopaque, saved: api.prompt_cache.Saved, dir: [:0]const u8, key: u64) anyerror!void {
+    if (active_host) |h| {
+        if (h.gpu) |g| g.ctx.makeCurrent() catch {};
+    }
+    const sn_write = raw_snap_write orelse return error.NoSnapWrite;
+    return sn_write(ptr, saved, dir, key);
 }
 
 test "this host's /proc/meminfo reads whole and parses (Linux)" {

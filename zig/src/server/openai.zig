@@ -124,11 +124,12 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     // an engine with vision takes image parts: their placeholders in the text, their bytes in input.images
     var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "" };
     const take: ?*messages.Images = if (srv.info.vision != null) &images else null;
+    // the client's text stays text: a control token's spelling in it does not become the token (issue #21)
     if (is_chat) {
-        input.messages = try messages.normalizeImages(cx, body.get("messages"), "system", srv.needs_user_after_tool, take);
-        input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
+        input.messages = try messages.normalizeImages(cx, try messages.maskControls(cx.a, srv.text, body.get("messages")), "system", srv.needs_user_after_tool, take);
+        input.tools = try tool_specs.active(cx, try messages.maskControls(cx.a, srv.text, body.get("tools")), body.get("tool_choice"));
     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
-        input.messages = try messages.normalizeImages(cx, m, "system", srv.needs_user_after_tool, take);
+        input.messages = try messages.normalizeImages(cx, (try messages.maskControls(cx.a, srv.text, m)).?, "system", srv.needs_user_after_tool, take);
     };
     input.images = images.list.items;
     if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
@@ -365,7 +366,8 @@ const Run = struct {
         if (r.is_chat) {
             const message = try json.newObject(a);
             try message.put(a, "role", .{ .string = "assistant" });
-            try message.put(a, "content", if (calls != null) .null else .{ .string = reply.content });
+            // the text before the calls is the reply's too (DeepSeek-V4.1's reference parser keeps it as the content)
+            try message.put(a, "content", if (calls != null and reply.content.len == 0) .null else .{ .string = reply.content });
             if (reply.reasoning) |t| if (t.len > 0) try message.put(a, "reasoning_content", .{ .string = t });
             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
             try choice.put(a, "message", .{ .object = message });

@@ -61,6 +61,12 @@ pub fn main(init: std.process.Init) !u8 {
     var parallel: ?usize = null; // default: every stream of the pool
     var arena_gib: ?usize = null;
     var profile = false;
+    if (std.c.getenv("TF_DS_STREAMS")) |v| {
+        o.streams = std.fmt.parseInt(usize, std.mem.span(v), 10) catch o.streams;
+    }
+    if (std.c.getenv("TF_DS_ROUND_ROWS")) |v| {
+        o.round_rows = std.fmt.parseInt(usize, std.mem.span(v), 10) catch o.round_rows;
+    }
     // TF_DS_CLOCK_MARKS=1 with --profile: a GPU clock at every round phase mark (in the graphs too; it splits their
     // PDL chains, so the stretch totals run long), else only around the stretches
     const clock_marks: u8 = if (std.c.getenv("TF_DS_CLOCK_MARKS")) |v| std.fmt.parseInt(u8, std.mem.span(v), 10) catch 0 else 0;
@@ -117,6 +123,9 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, key, "--logits-sha")) {
             dsv41.lanes.logits_sha = !std.mem.eql(u8, val, "0");
         } else return error.BadArgument;
+    }
+    if (parallel) |p| {
+        if (p > o.streams) o.streams = p;
     }
     const par = parallel orelse o.streams;
     if (par == 0 or par > o.streams or o.streams > dsv41.model.max_streams) return error.BadArgument;

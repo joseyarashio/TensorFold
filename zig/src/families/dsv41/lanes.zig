@@ -464,7 +464,7 @@ pub const Lanes = struct {
             m.fill_seq = &.{};
         }
         var ran: usize = 0;
-        while (f.start < f.len and ran < chunks) : (ran += 1) {
+        while (f.start < f.len and (ran < chunks or !s.shares())) : (ran += 1) {
             const start = f.start;
             const len = f.len;
             if (start > 0 and s.isCancelled()) return error.Cancelled;
@@ -573,6 +573,7 @@ pub const Lanes = struct {
         if (s.images.len > 0) {
             const image_id = m.cfg.image_token orelse return error.NoVision;
             const row_bytes = m.cfg.hidden * 2;
+            const resume_at: usize = if (kept) |sn| sn.at else 0;
             var at_row: usize = 0;
             for (s.images) |img| {
                 if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
@@ -580,6 +581,7 @@ pub const Lanes = struct {
                     if (q.* != @as(i64, image_id)) return error.BadImageSpan;
                     q.* = -1;
                 }
+                if (@as(usize, img.at) + img.tokens <= resume_at) continue;
                 if (img.rows) {
                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
                     try rows.appendSlice(gpa, img.bytes);

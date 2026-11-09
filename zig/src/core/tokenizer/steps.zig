@@ -13,6 +13,7 @@ pub const Context = struct {
     matcher: regex.Matcher,
     spans: std.ArrayList(Span) = .empty,
     hits: std.ArrayList([2]usize) = .empty,
+    word: ?*std.heap.ArenaAllocator = null,
 };
 
 pub const Span = struct { start: usize, end: usize, matched: bool };

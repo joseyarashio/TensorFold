@@ -205,6 +205,14 @@ pub const LaneHost = struct {
         return job.host.closing or std.mem.indexOfScalar(Id, job.host.cancels.items, job.id) != null;
     }
 
+    fn othersWait(ctx: *anyopaque) bool {
+        const job: *Job = @ptrCast(@alignCast(ctx));
+        const h = job.host;
+        h.lock();
+        defer h.unlock();
+        return h.queued.items.len > 0 or (h.filling != null and h.filling != job) or h.core.activeCount() > 0 or h.cancels.items.len > 0 or h.closing;
+    }
+
     /// Hands a stream the tokens its rounds committed since the last delivery.
     fn send(h: *LaneHost, job: *Job) void {
         const emitted = job.stream.emitted();
@@ -351,6 +359,7 @@ pub const LaneHost = struct {
             .proposer = job.proposer.proposer(),
             .stop_check = if (r.stop) |s| .{ .ptr = s.ctx, .check = s.check } else null,
             .cancel_check = .{ .ptr = job, .check = cancelled },
+            .share_check = .{ .ptr = job, .check = othersWait },
             .think_budget = r.think_budget,
             .think_close = r.think_close,
             .think_end = if (r.think_end) |t| t else -1,

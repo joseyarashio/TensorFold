@@ -128,6 +128,7 @@ pub const Spec = struct {
     proposer: ?Proposer = null,
     stop_check: ?StopCheck = null,
     cancel_check: ?CancelCheck = null,
+    share_check: ?CancelCheck = null,
     think_budget: u32 = 0,
     think_close: []const u32 = &.{},
     think_end: i64 = -1,
@@ -148,6 +149,7 @@ pub const Stream = struct {
     proposer: ?Proposer,
     stop_check: ?StopCheck,
     cancel_check: ?CancelCheck,
+    share_check: ?CancelCheck = null,
     think_budget: u32,
     think_close: []const u32,
     think_end: i64,
@@ -202,6 +204,7 @@ pub const Stream = struct {
             .proposer = if (spec.drafts) spec.proposer else null,
             .stop_check = spec.stop_check,
             .cancel_check = spec.cancel_check,
+            .share_check = spec.share_check,
             .think_budget = spec.think_budget,
             .think_close = spec.think_close,
             .think_end = spec.think_end,
@@ -258,6 +261,11 @@ pub const Stream = struct {
     /// Whether the request was cancelled (false with no hook); a prompt pass asks before each chunk.
     pub fn isCancelled(s: *const Stream) bool {
         const c = s.cancel_check orelse return false;
+        return c.check(c.ptr);
+    }
+
+    pub fn shares(s: *const Stream) bool {
+        const c = s.share_check orelse return true;
         return c.check(c.ptr);
     }
 

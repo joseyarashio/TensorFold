@@ -32,6 +32,19 @@ pub const DType = enum {
         inline for (names) |n| if (std.mem.eql(u8, text, n[0])) return n[1];
         return null;
     }
+
+    pub fn name(self: DType) []const u8 {
+        return switch (self) {
+            .bf16 => "bfloat16",
+            .f16 => "float16",
+            .f32 => "float32",
+            .i16 => "int16",
+            .i32 => "int32",
+            .i64 => "int64",
+            .u8 => "uint8",
+            .f8e4m3 => "float8_e4m3fn",
+        };
+    }
 };
 
 /// One tensor in the file: its bytes are [offset, offset + bytes).
@@ -140,6 +153,33 @@ pub fn find(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, rank: u32, world: u32) 
         found = try gpa.dupe(u8, e.name);
     }
     return found orelse error.NoRankCache;
+}
+
+pub fn writeRow(w: *Io.Writer, key: []const u8, dtype: DType, shape: []const usize, offset: u64, bytes: u64) !void {
+    try w.writeByte('[');
+    try jsonString(w, key);
+    try w.print(", \"{s}\", [", .{dtype.name()});
+    for (shape, 0..) |d, i| try w.print("{s}{d}", .{ if (i > 0) ", " else "", d });
+    try w.print("], {d}, {d}]", .{ offset, bytes });
+}
+
+fn jsonString(w: *Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |ch| switch (ch) {
+        '"', '\\' => {
+            try w.writeByte('\\');
+            try w.writeByte(ch);
+        },
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        0x08 => try w.writeAll("\\b"),
+        0x0c => try w.writeAll("\\f"),
+        0x00...0x07, 0x0b, 0x0e...0x1f, 0x7f => try w.print("\\u{x:0>4}", .{ch}),
+        0x80...0xff => return error.NonAsciiKey,
+        else => try w.writeByte(ch),
+    };
+    try w.writeByte('"');
 }
 
 /// A cache file as weights.py writes one, for the tests: each tensor's bytes, then the index, offset and magic.

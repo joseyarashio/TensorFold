@@ -180,6 +180,134 @@ pub fn graphs(gpu: Gpu) !void {
     try explicitGraphs(gpu, probe, stream);
 }
 
+fn stepOn(step: cuda.Function, counter: cuda.DeviceBuffer, stream: cuda.Stream) !void {
+    var args: cuda.Args = .{};
+    args.add(counter.ptr);
+    args.add(@as(u64, 1));
+    try cuda.launch.launch(step, .{ .grid = .{}, .block = .{} }, stream, &args);
+}
+
+/// `res` is an error: what CUDA must refuse here.
+fn mustFail(res: anytype, what: []const u8) !void {
+    if (res) |_| {
+        std.debug.print("FAIL {s}: CUDA took it\n", .{what});
+        return error.TestFailed;
+    } else |_| {}
+}
+
+const ForkedCapture = struct {
+    step: cuda.Function,
+    counter: cuda.DeviceBuffer,
+    main: cuda.Stream,
+    side: cuda.Stream,
+    fork: cuda.Event,
+    join: cuda.Event,
+
+    /// Where a dsv41 round's stretch stands after a mix: work on the main stream and work forked to the side stream,
+    /// its join recorded and not yet waited on.
+    fn begin(f: ForkedCapture) !void {
+        try cuda.graph.beginCapture(f.main, .thread_local);
+        try stepOn(f.step, f.counter, f.main);
+        try f.fork.record(f.main);
+        try f.side.wait(f.fork);
+        try stepOn(f.step, f.counter, f.side);
+        try f.join.record(f.side);
+    }
+
+    fn outOfCapture(f: ForkedCapture) !void {
+        try expect(try cuda.graph.captureStatus(f.main) == .none, "main stream left the capture", .{});
+        try expect(try cuda.graph.captureStatus(f.side) == .none, "side stream left the capture", .{});
+    }
+
+    /// A capture joined in order ends, leaves no stream capturing, and its graph runs both streams' work.
+    fn works(f: ForkedCapture) !void {
+        try f.begin();
+        try expect(try cuda.graph.captureStatus(f.side) == .active, "the fork pulls the side stream into the capture", .{});
+        try f.main.wait(f.join);
+        var graph = try cuda.graph.endCapture(f.main);
+        defer graph.deinit();
+        try f.outOfCapture();
+        var exec = try graph.instantiate();
+        defer exec.deinit();
+        const before = try readCounter(f.counter);
+        try exec.launchOn(f.main);
+        try f.main.synchronize();
+        try expect(try readCounter(f.counter) == before + 2, "the graph runs both streams' work", .{});
+    }
+};
+
+/// A capture with work forked to a second stream, as dsv41's rounds fork their side and prefetch streams, and what a
+/// failed one leaves. The streams recover by themselves; a later wait on the dead capture's join does not (the
+/// DeepSeek-V4.1-Flash 2-Spark recipe's issue #65: 904, then INVALID_VALUE and 901 on new captures for hours).
+pub fn captureFork(gpu: Gpu) !void {
+    const d = gpu.d;
+    var probe = try cuda.Module.load(d, cuda.kernels.probe);
+    defer probe.unload();
+    const step = try probe.function("tf_probe_step");
+    var counter = try cuda.DeviceBuffer.alloc(d, 8);
+    defer counter.free();
+    try counter.fill8(0, null);
+    var main = try cuda.Stream.init(d, true);
+    defer main.deinit();
+    var side = try cuda.Stream.init(d, true);
+    defer side.deinit();
+    var fork = try cuda.Event.init(d, false);
+    defer fork.deinit();
+    var join = try cuda.Event.init(d, false);
+    defer join.deinit();
+    const f: ForkedCapture = .{ .step = step, .counter = counter, .main = main, .side = side, .fork = fork, .join = join };
+
+    try f.works();
+    check.pass("joined: the capture ends, no stream stays in it, its graph runs both streams' work", .{});
+
+    try f.begin();
+    try mustFail(cuda.graph.endCapture(main), "ending a capture with unjoined work");
+    try f.outOfCapture();
+    try f.works();
+    check.pass("ended unjoined: refused (904), yet no stream stays in it and the next capture works", .{});
+
+    // a graph captured while all is well, for the replays below
+    try cuda.graph.beginCapture(main, .thread_local);
+    try stepOn(step, counter, main);
+    var good = try cuda.graph.endCapture(main);
+    defer good.deinit();
+    var exec = try good.instantiate();
+    defer exec.deinit();
+
+    try f.begin();
+    try mustFail(cuda.graph.endCapture(main), "ending a capture with unjoined work");
+    for (0..3) |_| {
+        try cuda.graph.beginCapture(main, .thread_local);
+        try mustFail(main.wait(join), "a new capture waiting on the dead capture's join");
+        try expect(try cuda.graph.captureStatus(main) == .invalidated, "the refused wait invalidates the capture", .{});
+        try mustFail(stepOn(step, counter, main), "a launch in an invalidated capture");
+        try mustFail(cuda.graph.endCapture(main), "ending an invalidated capture");
+        try f.outOfCapture();
+        const before = try readCounter(counter);
+        try exec.launchOn(main);
+        try main.synchronize();
+        try expect(try readCounter(counter) == before + 1, "a graph already captured still replays", .{});
+    }
+    check.pass("waiting on the dead capture's join: refused every time (1, then 901), while a graph already captured replays", .{});
+
+    try f.works();
+    check.pass("without that wait the next capture works", .{});
+
+    var other = try cuda.Stream.init(d, true);
+    defer other.deinit();
+    var outside = try cuda.Event.init(d, false);
+    defer outside.deinit();
+    try outside.record(other);
+    try f.begin();
+    try mustFail(main.wait(outside), "a capture waiting on uncaptured work");
+    try expect(try cuda.graph.captureStatus(side) == .invalidated, "the side stream's part is invalidated too", .{});
+    try mustFail(main.wait(join), "a join in an invalidated capture");
+    try mustFail(cuda.graph.endCapture(main), "ending an invalidated capture");
+    try f.outOfCapture();
+    try f.works();
+    check.pass("invalidated with work forked: the join and the end refused (901), yet no stream stays in it and the next capture works", .{});
+}
+
 fn readCounter(counter: cuda.DeviceBuffer) !u64 {
     var v: u64 = 0;
     try counter.download(0, std.mem.asBytes(&v));

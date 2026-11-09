@@ -877,10 +877,7 @@ pub const Graphs = struct {
         const start = cy.*;
         try cuda.graph.beginCapture(e.s, .thread_local);
         stretch(e, rd, ch, cs, rings, cy, li, end, null) catch |err| {
-            if (cuda.graph.endCapture(e.s)) |got| {
-                var x = got;
-                x.deinit();
-            } else |_| {}
+            leaveCapture(StretchCapture{ .e = e, .rd = rd });
             return err;
         };
         var graph = try cuda.graph.endCapture(e.s);
@@ -895,6 +892,45 @@ pub const Graphs = struct {
         } else if (std.math.isPowerOfTwo(g.lru.count()) and g.lru.count() >= 64) std.log.info("dsv41: CUDA graphs: {d} kept", .{g.lru.count()});
     }
 };
+
+/// What leaveCapture does to a stretch's capture.
+const StretchCapture = struct {
+    e: *const Engine,
+    rd: *Round,
+
+    fn joinSide(c: StretchCapture) !void {
+        return c.rd.joinSide(c.e);
+    }
+
+    fn joinPrefetch(c: StretchCapture) !void {
+        return c.rd.joinPrefetch(c.e);
+    }
+
+    fn end(c: StretchCapture) !cuda.graph.Graph {
+        return cuda.graph.endCapture(c.e.s);
+    }
+
+    fn forgetForked(c: StretchCapture) void {
+        c.rd.side_out = false;
+        c.rd.pf_out = false;
+    }
+};
+
+/// A stretch failed inside its capture. What it forked is joined so the capture ends cleanly (ended unjoined it fails
+/// with STREAM_CAPTURE_UNJOINED, though the streams leave capture all the same). Then the round forgets that work,
+/// whatever those calls did: a stretch starts with nothing forked, so all of it belonged to this capture. A flag left
+/// set would make the next capture's first mix wait on an event recorded only in this one, which CUDA refuses
+/// (INVALID_VALUE, then STREAM_CAPTURE_INVALIDATED on all that follows). The refused wait leaves the flag set, so every
+/// new capture would fail until a restart while graphs already captured kept replaying (`tf-cuda-test capture-fork`).
+fn leaveCapture(cap: anytype) void {
+    cap.joinSide() catch {};
+    cap.joinPrefetch() catch {};
+    if (cap.end()) |got| {
+        var graph = got;
+        graph.deinit();
+    } else |_| {}
+    cap.forgetForked();
+}
 
 /// A round of these rows through every layer and the head: rd.logits [R, vocab] and rd.taps. The caches (ring, the
 /// compressed rows, the positional store) are the prompt's, extended by the rows; eh: the Engram host (the rows' n-grams
@@ -1131,6 +1167,69 @@ test "context buckets as graph.py makes them" {
     try std.testing.expectEqual(@as(usize, 4096), bucketFor(4096, 1 << 20));
     try std.testing.expectEqual(@as(usize, 8192), bucketFor(4097, 1 << 20));
     try std.testing.expectEqual(@as(usize, 4096), bucketFor(5000, 4096));
+}
+
+test "a failed stretch joins what it forked, ends its capture, and owes the next capture no join" {
+    const Fake = struct {
+        const Call = enum { side, prefetch, end, free, forget };
+        calls: [5]Call = undefined,
+        n: usize = 0,
+        side_fails: bool = false,
+        prefetch_fails: bool = false,
+        end_fails: bool = false,
+
+        const Self = @This();
+        const Graph = struct {
+            f: *Self,
+            fn deinit(g: *Graph) void {
+                g.f.note(.free);
+            }
+        };
+
+        fn note(f: *Self, c: Call) void {
+            f.calls[f.n] = c;
+            f.n += 1;
+        }
+        fn joinSide(f: *Self) !void {
+            f.note(.side);
+            if (f.side_fails) return error.CudaFailed;
+        }
+        fn joinPrefetch(f: *Self) !void {
+            f.note(.prefetch);
+            if (f.prefetch_fails) return error.CudaFailed;
+        }
+        fn end(f: *Self) !Graph {
+            f.note(.end);
+            if (f.end_fails) return error.CudaFailed;
+            return .{ .f = f };
+        }
+        fn forgetForked(f: *Self) void {
+            f.note(.forget);
+        }
+    };
+    // both joins before the end, the graph it returns freed, the flags cleared last
+    const whole = [_]Fake.Call{ .side, .prefetch, .end, .free, .forget };
+    var ok: Fake = .{};
+    leaveCapture(&ok);
+    try std.testing.expectEqualSlices(Fake.Call, &whole, ok.calls[0..ok.n]);
+    // a failed join stops nothing after it
+    var side: Fake = .{ .side_fails = true };
+    leaveCapture(&side);
+    try std.testing.expectEqualSlices(Fake.Call, &whole, side.calls[0..side.n]);
+    var prefetch: Fake = .{ .prefetch_fails = true };
+    leaveCapture(&prefetch);
+    try std.testing.expectEqualSlices(Fake.Call, &whole, prefetch.calls[0..prefetch.n]);
+    // an invalidated capture's refused joins and end still clear the flags
+    var dead: Fake = .{ .side_fails = true, .prefetch_fails = true, .end_fails = true };
+    leaveCapture(&dead);
+    try std.testing.expectEqualSlices(Fake.Call, &.{ .side, .prefetch, .end, .forget }, dead.calls[0..dead.n]);
+    // the real one clears both flags
+    var rd: Round = undefined;
+    rd.side_out = true;
+    rd.pf_out = true;
+    (StretchCapture{ .e = undefined, .rd = &rd }).forgetForked();
+    try std.testing.expect(!rd.side_out);
+    try std.testing.expect(!rd.pf_out);
 }
 
 /// error.NotPortedYet with its site on stderr (a request that reaches a path the port lacks names it in the log).

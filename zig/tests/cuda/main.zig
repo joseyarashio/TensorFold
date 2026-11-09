@@ -14,6 +14,7 @@ const usage =
     \\  info                      driver, device and library versions
     \\  smoke                     copies, fills, launches, argument packing, module globals
     \\  graph                     stream capture, explicit graphs, node and whole-exec updates
+    \\  capture-fork              a capture with work forked to a second stream, and what a failed one leaves
     \\  overhead [n] [reps]       dependent one-thread kernels: plain stream vs one graph
     \\  overhead-pdl [n] [reps]   the same with programmatic dependent launch on every kernel
     \\  launch-ex                 cuLaunchKernelEx: clusters, cooperative grid, PDL on a stream and in a graph
@@ -61,6 +62,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "info")) return info(gpu);
     if (std.mem.eql(u8, cmd, "smoke")) return runtime_tests.smoke(gpu);
     if (std.mem.eql(u8, cmd, "graph")) return runtime_tests.graphs(gpu);
+    if (std.mem.eql(u8, cmd, "capture-fork")) return runtime_tests.captureFork(gpu);
     if (std.mem.eql(u8, cmd, "overhead") or std.mem.eql(u8, cmd, "overhead-pdl")) {
         const n = if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else 1000;
         const reps = if (rest.len > 1) try std.fmt.parseInt(usize, rest[1], 10) else 20;

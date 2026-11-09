@@ -197,18 +197,24 @@ pub const Streamer = struct {
         return s.feedDsmlTo(t, out, true);
     }
 
-    fn feedDsmlTo(s: *Streamer, t: []const u8, out: *std.ArrayList(Value), one_block: bool) Allocator.Error!void {
+    fn feedDsmlTo(s: *Streamer, text: []const u8, out: *std.ArrayList(Value), one_block: bool) Allocator.Error!void {
         const d = &s.dsml;
         const a = s.a;
         // the saved positions hold only in a text that extends the one read before; a shorter one turns the streamer
         // off, and the finish then follows the parse (Dsml.verify checks the whole text once)
-        if (t.len < d.read) d.off = true;
-        if (!d.off and t.len > d.read) {
-            try d.seen.appendSlice(a, t[d.read..]);
-            d.read = t.len;
+        if (text.len < d.read) {
+            d.off = true;
+            d.cap = null;
         }
+        if (!d.off and text.len > d.read) {
+            try d.seen.appendSlice(a, text[d.read..]);
+            d.read = text.len;
+        }
+        defer d.shown = if (d.off) 0 else d.visible(text).len;
         while (!d.off) {
-            d.bounds(t);
+            d.bounds(text);
+            // a closer the text has not yet said is the block's: the text is read as if it ended there
+            const t = d.visible(text);
             switch (d.state) {
                 .outside => {
                     if (one_block) return;
@@ -224,13 +230,22 @@ pub const Streamer = struct {
                     }
                     d.pos = i.at + tool_parse.dsml41_open.len;
                     d.block_end = null;
+                    d.cap = null;
+                    d.block_start = d.pos;
                     d.block_from = d.pos;
+                    d.first_close = null;
+                    d.walk = .{};
                     d.block_calls = 0;
+                    d.block_first = d.sent.items.len;
                     d.state = .block;
                 },
                 .block => switch (findIn(t, tool_parse.invoke41_open, d.pos, d.block_end)) {
                     .wait => return,
                     .none => {
+                        if (d.block_end.? != d.first_close.?) {
+                            try d.withhold(a);
+                            return;
+                        }
                         // the block's closer: every invoke in it is decided, and the calls it held go out
                         try d.closePending(a, out);
                         try d.release(a, out);
@@ -267,7 +282,7 @@ pub const Streamer = struct {
                         d.end_pending = true;
                         d.end_from = q + 2;
                         d.state = .skip;
-                        d.bounds(t);
+                        d.bounds(text);
                         if (!d.end_pending and d.end == null) {
                             d.state = .block; // no closer in its block: the parse takes no call here
                             continue;
@@ -390,8 +405,8 @@ pub const Streamer = struct {
                                 .ok => |x| x,
                                 .err => .{ .string = raw },
                             };
-                            const text = try json.stringify(a, parsed, .{ .ascii = false, .compact = true });
-                            try d.key(a, t[d.ns..d.nq], try std.mem.concat(a, u8, &.{ ":", text }), out);
+                            const written = try json.stringify(a, parsed, .{ .ascii = false, .compact = true });
+                            try d.key(a, t[d.ns..d.nq], try std.mem.concat(a, u8, &.{ ":", written }), out);
                             d.p = pe + tool_parse.param41_close.len;
                             d.state = .body;
                         },
@@ -407,6 +422,13 @@ pub const Streamer = struct {
         }
     }
 };
+
+/// The parse takes every call ``sent`` holds, as its first calls: what a stream withheld for them may go out.
+pub fn parseTakes(sent: []const SentCall, parsed: []const Value) bool {
+    if (sent.len > parsed.len) return false;
+    for (sent, parsed[0..sent.len]) |*c, p| if (!c.same(p)) return false;
+    return true;
+}
 
 /// A DSML call a stream sent: its name, the arguments text that went out, and whether it closed.
 pub const SentCall = struct {
@@ -468,8 +490,13 @@ pub const Dsml = struct {
     pos: usize = 0, // the parse's next invoke search (outside: its next block search)
     from: usize = 0, // where a search that waits starts again (the text before it holds no complete needle)
     gap: usize = 0, // the end of the last block: the text from here to the next one holds no other call form
-    block_end: ?usize = null, // the block's closer, once it is in the text
-    block_from: usize = 0,
+    block_end: ?usize = null, // the block's closer, once the text says which closer that is
+    block_start: usize = 0, // just past the block's opener
+    block_from: usize = 0, // where the search for the block's first closer starts again
+    first_close: ?usize = null, // the block's first closer, once in the text
+    walk: reply_text.WalkResume = .{},
+    shown: usize = 0, // the length of the text the last feed read
+    cap: ?usize = null, // a closer is in the text, but the text has not said yet that it ends the block (it may sit in a value)
     name_start: usize = 0,
     q: usize = 0, // the invoke name's closing quote
     end: ?usize = null, // the invoke's closer (null and not end_pending: the block holds none)
@@ -489,6 +516,17 @@ pub const Dsml = struct {
     queue: std.ArrayList(Value) = .empty, // the deltas that wait
     released: usize = 0, // the calls whose header went out: sent[0..released]
     late: ?usize = null, // the block's first call, whose brace waits in the queue
+    block_first: usize = 0, // sent[block_first..]: the calls of the block being read
+    // a block read past a closer inside a value: the parse may still take another reading of the reply, so what completes
+    // the block's calls (their braces, its later calls) waits for the reply's end, and the stream stops there
+    deferred: bool = false,
+    withheld: std.ArrayList(Value) = .empty,
+    wire_released: usize = 0, // the calls whose header went out when the block closed
+    undo: std.ArrayList(Undo) = .empty, // each of the block's calls as it went out, before what is withheld
+
+    fn visible(d: *const Dsml, text: []const u8) []const u8 {
+        return if (d.cap) |c| text[0..@min(c, text.len)] else text;
+    }
 
     /// A call is under way: its block opened, or its brace waits.
     pub fn midCall(d: *const Dsml) bool {
@@ -498,6 +536,30 @@ pub const Dsml = struct {
     /// The calls the client got (their headers went out), for the finish to check against the parse.
     pub fn streamed(d: *const Dsml) []const SentCall {
         return d.sent.items[0..d.released];
+    }
+
+    const Undo = struct { i: usize, len: usize, closed: bool };
+
+    /// The calls the client has when what ``deferred`` withheld never goes out.
+    pub fn wire(d: *const Dsml, a: Allocator) Allocator.Error![]const SentCall {
+        if (!d.deferred) return d.streamed();
+        const out = try a.alloc(SentCall, d.wire_released);
+        @memcpy(out, d.sent.items[0..d.wire_released]);
+        for (d.undo.items) |u| if (u.i < out.len) {
+            out[u.i].arguments.items = out[u.i].arguments.items[0..u.len]; // a view: the copy shares the record's bytes
+            out[u.i].closed = u.closed;
+        };
+        return out;
+    }
+
+    /// The block closed past a closer inside a value: its calls complete only if the reply's parse takes them.
+    fn withhold(d: *Dsml, a: Allocator) Allocator.Error!void {
+        d.deferred = true;
+        d.wire_released = d.released;
+        for (d.sent.items[d.block_first..], d.block_first..) |c, i| try d.undo.append(a, .{ .i = i, .len = c.arguments.items.len, .closed = c.closed });
+        try d.closePending(a, &d.withheld);
+        try d.release(a, &d.withheld);
+        d.off = true;
     }
 
     /// The finish's ``text`` must extend the text the stream read, else its positions do not hold there: the streamer
@@ -528,17 +590,21 @@ pub const Dsml = struct {
         return if (d.end_pending) null else d.end;
     }
 
-    /// The block's closer and the invoke's closer, found as soon as they are in the text.
-    fn bounds(d: *Dsml, t: []const u8) void {
+    /// The block's closer and the invoke's closer, found as soon as the text says where they are. The block's closer is
+    /// the one ``reply_text.blockEnd`` gives, as the parse's longer reading takes it: a closer inside a parameter value
+    /// (a file about DSML) does not end the block, and the value streams on past it.
+    fn bounds(d: *Dsml, text: []const u8) void {
         if (d.state == .outside) return;
-        if (d.block_end == null) {
-            if (d.block_from <= t.len) if (std.mem.indexOfPos(u8, t, d.block_from, tool_parse.dsml41_close)) |i| {
-                d.block_end = i;
-            };
-            if (d.block_end == null) d.block_from = @max(d.block_from, t.len -| (tool_parse.dsml41_close.len - 1));
+        if (d.block_end == null and d.first_close == null) {
+            if (d.block_from <= text.len) d.first_close = std.mem.indexOfPos(u8, text, d.block_from, tool_parse.dsml41_close);
+            if (d.first_close == null) d.block_from = @max(d.block_from, text.len -| (tool_parse.dsml41_close.len - 1));
         }
+        if (d.block_end == null) if (d.first_close) |c| {
+            d.block_end = reply_text.blockEndResume(text, d.block_start, tool_parse.dsml41_open, tool_parse.dsml41_close, c, &d.walk);
+            d.cap = if (d.block_end == null) @max(c, d.shown) else null; // what the last feed read stays read
+        };
         if (!d.end_pending) return;
-        switch (findIn(t, tool_parse.invoke41_close, d.end_from, d.block_end)) {
+        switch (findIn(d.visible(text), tool_parse.invoke41_close, d.end_from, d.block_end)) {
             .at => |i| {
                 d.end = i;
                 d.end_pending = false;
@@ -547,7 +613,7 @@ pub const Dsml = struct {
                 d.end = null;
                 d.end_pending = false;
             },
-            .wait => d.end_from = @max(d.end_from, t.len -| (tool_parse.invoke41_close.len - 1)),
+            .wait => d.end_from = @max(d.end_from, d.visible(text).len -| (tool_parse.invoke41_close.len - 1)),
         }
     }
 
@@ -815,6 +881,7 @@ test "a one-call reply drops an unoffered call and still hides an unclosed one" 
 }
 
 const tool_parse = @import("tool_parse.zig");
+const clock = @import("clock.zig");
 
 /// The deltas one streamer sends while the reply grows through ``texts``.
 fn streamed(a: Allocator, tools: []const Value, texts: []const []const u8) Allocator.Error![]Value {
@@ -866,6 +933,11 @@ fn dsmlFeed(a: Allocator, text: []const u8, step: usize, chars: bool) !Streamer 
         try s.feedDsml(text[0..end], &out);
     }
     try s.feedDsml(text, &out);
+    // the reply's end, as the route settles it: what a block read past a closer inside a value withheld goes out only when
+    // the parse takes the calls that went out
+    const parsed = (try tool_parse.parse(a, text, (try json.parse(a, dsml_tools)).ok.array, null)).calls orelse &.{};
+    const takes = parseTakes(s.dsml.streamed(), parsed);
+    if (s.dsml.deferred and takes) try out.appendSlice(a, s.dsml.withheld.items);
     var joined: std.ArrayList(std.ArrayList(u8)) = .empty;
     for (out.items) |d| for (d.get("tool_calls").?.array) |one| {
         const index: usize = @intCast(one.get("index").?.int64().?);
@@ -881,8 +953,9 @@ fn dsmlFeed(a: Allocator, text: []const u8, step: usize, chars: bool) !Streamer 
         try joined.items[index].appendSlice(a, piece);
     };
     // what went out: the calls whose header went out (a block that never closes holds its later calls)
-    try std.testing.expectEqual(s.dsml.streamed().len, joined.items.len);
-    for (s.dsml.streamed(), joined.items) |c, j| try std.testing.expectEqualStrings(c.arguments.items, j.items);
+    const client = if (takes) s.dsml.streamed() else try s.dsml.wire(a);
+    try std.testing.expectEqual(client.len, joined.items.len);
+    for (client, joined.items) |c, j| try std.testing.expectEqualStrings(c.arguments.items, j.items);
     return s;
 }
 
@@ -959,7 +1032,7 @@ test "where the parse drops or changes what already went out, the stream says so
     const unclosed = comptime (calls_open ++ "<" ++ D ++ " invoke name=\"Bash\">\n" ++ dsmlParam("command", " string=\"true\"", "ls") ++ calls_close);
     try std.testing.expect((try tool_parse.parse(a, unclosed, tools, null)).calls == null);
     const u = try dsmlFeed(a, unclosed, 1, true);
-    try std.testing.expect(u.dsml.sent.items.len == 1 and u.dsml.sent.items[0].held and !u.dsml.sent.items[0].closed);
+    try std.testing.expect(u.dsml.sent.items.len == 1 and !u.dsml.sent.items[0].closed and u.dsml.cap != null);
     // a value that holds an invoke's closer: the parse ends the invoke there and drops the value
     const cut = comptime (calls_open ++ dsmlInvoke("Write", dsmlParam("file_path", " string=\"true\"", "/a") ++ "<" ++ D ++ " parameter name=\"content\" string=\"true\">x</" ++ D ++ " invoke>y</" ++ D ++ " parameter>\n") ++ calls_close);
     const w = (try tool_parse.parse(a, cut, tools, null)).calls.?;
@@ -970,6 +1043,31 @@ test "where the parse drops or changes what already went out, the stream says so
     const xml = comptime ("<tool_call>{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}</tool_call>" ++ calls_open ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "pwd")) ++ calls_close);
     const x = try dsmlFeed(a, xml, 3, true);
     try std.testing.expect(x.dsml.off and x.dsml.sent.items.len == 0);
+}
+
+test "a closer inside a value: the pieces before it go out as they decode, the rest waits until the text says where the block ends" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const closer = "</" ++ D ++ " calls>";
+    const head = comptime (calls_open ++ "<" ++ D ++ " invoke name=\"Write\">\n" ++ dsmlParam("file_path", " string=\"true\"", "/a") ++ "<" ++ D ++ " parameter name=\"content\" string=\"true\">end: ");
+    const tail = comptime (" and more</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n" ++ closer);
+    // the stream sends the parse's call at every split
+    try expectDsmlParsed(head ++ closer ++ tail, 1);
+    // read up to the closer in the value, the text cannot say yet that it does not end the block: what the rounds before
+    // read stays sent (the closer's text up to its '>'), nothing after it goes out, and the call is open
+    const s = try dsmlFeed(a, head ++ closer, 1, true);
+    const c = &s.dsml.sent.items[0];
+    try std.testing.expect(s.dsml.cap != null and !c.closed);
+    try std.testing.expectEqualStrings("{\"file_path\":\"/a\",\"content\":\"end: </" ++ D ++ " calls", c.arguments.items);
+    // the text after it says the invoke goes on: the block ends at its last closer and the call is whole
+    const done = try dsmlFeed(a, head ++ closer ++ tail, 1, true);
+    try std.testing.expect(done.dsml.cap == null and done.dsml.sent.items[0].closed);
+    try std.testing.expectEqualStrings("{\"file_path\":\"/a\",\"content\":\"end: " ++ closer ++ " and more\"}", done.dsml.sent.items[0].arguments.items);
+    // a closer that does end the block resolves in the round that completes it: the call closes at once
+    const plain = comptime (calls_open ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "ls")) ++ closer);
+    const p = try dsmlFeed(a, plain, 1, true);
+    try std.testing.expect(p.dsml.cap == null and p.dsml.sent.items[0].closed);
 }
 
 test "a block's second call and the first call's brace wait for the block's closer; a block cut before it sends no whole call" {
@@ -1013,4 +1111,21 @@ test "a text that does not extend the one read turns the streamer off instead of
     try t.feedDsml(streamed_text[0..40], &out);
     t.dsml.verify("other text, longer than forty bytes, that does not start with the first");
     try std.testing.expect(t.dsml.off);
+}
+
+test "a long value streams in time linear in its length: the search for the block's closer goes on where it stopped" {
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const head = "<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"Write\">\n<" ++ D ++ " parameter name=\"file_path\" string=\"true\">/a</" ++ D ++ " parameter>\n<" ++ D ++ " parameter name=\"content\" string=\"true\">";
+    const tail = "</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
+    const value = try a.alloc(u8, 1 << 18);
+    @memset(value, 'x');
+    const text = try std.mem.concat(a, u8, &.{ head, value, tail });
+    const started = clock.nowNs(std.testing.io);
+    const s = try dsmlFeed(a, text, 16, false);
+    const took = clock.seconds(clock.nowNs(std.testing.io) - started);
+    try std.testing.expect(s.dsml.sent.items.len == 1 and s.dsml.sent.items[0].closed);
+    // a scan from the block's start every round takes over 50 times longer at this size
+    try std.testing.expect(took < 2.0);
 }

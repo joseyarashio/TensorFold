@@ -9,6 +9,7 @@ const live = @import("live.zig");
 const listener_mod = @import("listener.zig");
 const model_text = @import("model_text.zig");
 const server_mod = @import("server.zig");
+const tool_streaming = @import("tool_streaming.zig");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
@@ -78,6 +79,15 @@ fn env(s: Setup, name: []const u8) ?[]const u8 {
     return m.get(name);
 }
 
+/// TENSORFOLD_TOOL_STREAM's mode, or null (said on stderr) for a value the server refuses to start with.
+fn toolStream(environ: ?*const std.process.Environ.Map) ?tool_streaming.Mode {
+    const v = if (environ) |m| m.get("TENSORFOLD_TOOL_STREAM") else null;
+    return tool_streaming.mode(v) catch {
+        std.debug.print("tensorfold: TENSORFOLD_TOOL_STREAM={s}: use live or hold (lower case); unset, empty or blank means live\n", .{v.?});
+        return null;
+    };
+}
+
 /// Serves until a stop signal; the process exit status.
 pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -120,6 +130,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
         .compact_keep = args.compact_keep,
         .compact_memory = args.compact_memory,
+        .tool_stream = toolStream(s.environ) orelse return 1,
     };
     const srv = server_mod.Server.init(gpa, io, s.engine, s.text, config, if (store.enabled()) &store else null) catch {
         std.debug.print("tensorfold: the server could not start\n", .{});
@@ -215,4 +226,15 @@ test "the raise lifts a low soft limit, and a second raise does nothing" {
     try std.testing.expectEqual(@as(u64, 256), raised[0]);
     try std.testing.expectEqual(raised[1], @as(u64, @intCast((try posix.getrlimit(.NOFILE)).cur)));
     try std.testing.expect(raiseOpenFileLimit() == null);
+}
+
+test "TENSORFOLD_TOOL_STREAM: unset is live, hold is hold, another value stops the server from starting" {
+    try std.testing.expectEqual(tool_streaming.Mode.live, toolStream(null).?);
+    var m: std.process.Environ.Map = .init(std.testing.allocator);
+    defer m.deinit();
+    try std.testing.expectEqual(tool_streaming.Mode.live, toolStream(&m).?);
+    try m.put("TENSORFOLD_TOOL_STREAM", "hold");
+    try std.testing.expectEqual(tool_streaming.Mode.hold, toolStream(&m).?);
+    try m.put("TENSORFOLD_TOOL_STREAM", "fast");
+    try std.testing.expect(toolStream(&m) == null);
 }

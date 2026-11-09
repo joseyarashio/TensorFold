@@ -37,7 +37,7 @@ pub const max_streams = draft.max_streams;
 /// The pool's streams when unset (--parallel 4).
 pub const max_streams_default = draft.default_streams;
 /// The RDMA ring's slot (the served 4.25 MiB: a 16-row round's logits half fits).
-pub const ring_bytes = 4456448;
+pub const ring_bytes = 5941952; // 8-slot RDMA ring buffer (30 layers * 144KB + aligned headers)
 
 pub const Options = struct {
     model_dir: []const u8, // config.json
@@ -410,7 +410,7 @@ pub const Model = struct {
     /// connected, and started once both are (an all-gather as the barrier).
     pub fn openRing(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, rank: u32, comm: *const comm_mod.Comm, stream: cuda.Stream) !*rdma.Ring {
         if (comm.world != 2) return error.NotTwoRanks;
-        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = try rdma_env.servedGidIndex(), .ack_timeout = try rdma_env.servedAckTimeout() });
+        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .slots = 8, .max_bytes = ring_bytes, .gid_index = try rdma_env.servedGidIndex(), .ack_timeout = try rdma_env.servedAckTimeout() });
         errdefer r.destroy(gpa);
         const per = @sizeOf(rdma.Info);
         const mine = [2]rdma.Info{ r.info(0), r.info(1) };
@@ -632,7 +632,10 @@ pub const Model = struct {
     }
 
     pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
-        if (slot >= m.streams) return error.BadSlot;
+        if (slot >= m.streams) {
+            std.debug.print("[fillBegin BadSlot] slot={d} >= m.streams={d}\n", .{ slot, m.streams });
+            return error.BadSlot;
+        }
         if (m.eh) |*eh| { // rows read ahead for another prompt are not this one's, even at the same positions
             eh.ahead_start = std.math.maxInt(usize);
             eh.ahead_ready = .{ false, false };

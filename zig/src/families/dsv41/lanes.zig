@@ -1218,7 +1218,10 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             .fill_begin => {
                 slot = try r.int(u32);
                 const base = try r.int(u64);
-                if (slot >= max_streams) return error.BadSlot;
+                if (slot >= max_streams) {
+                    std.debug.print("[follow fill_begin BadSlot] slot={d} >= max_streams={d}\n", .{ slot, max_streams });
+                    return error.BadSlot;
+                }
                 img_rows.clearRetainingCapacity();
                 try r.ids(gpa, &seqs[slot]);
                 m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
@@ -1227,7 +1230,10 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             .fill_resume => {
                 slot = try r.int(u32);
                 const base = try r.int(u64);
-                if (slot >= max_streams) return error.BadSlot;
+                if (slot >= max_streams) {
+                    std.debug.print("[follow fill_resume BadSlot] slot={d} >= max_streams={d}\n", .{ slot, max_streams });
+                    return error.BadSlot;
+                }
                 m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
                 m.fill_seq = seqs[slot].items;
             },
@@ -1298,7 +1304,10 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             .snap_save => {
                 const id = try r.int(u64);
                 const s: usize = try r.int(u32);
-                if (s >= max_streams) return error.BadSlot;
+                if (s >= max_streams) {
+                    std.debug.print("[follow snap_save BadSlot] s={d} >= max_streams={d}\n", .{ s, max_streams });
+                    return error.BadSlot;
+                }
                 var b = try cuda.DeviceBuffer.alloc(m.ctx.d, m.snapBytes());
                 m.snapCopy(s, b.ptr, true) catch |err| {
                     b.free();
@@ -1310,7 +1319,10 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             .snap_restore => {
                 const id = try r.int(u64);
                 const s: usize = try r.int(u32);
-                if (s >= max_streams) return error.BadSlot;
+                if (s >= max_streams) {
+                    std.debug.print("[follow snap_restore BadSlot] s={d} >= max_streams={d}\n", .{ s, max_streams });
+                    return error.BadSlot;
+                }
                 const from: usize = @intCast(try r.int(u64));
                 const to: usize = @intCast(try r.int(u64));
                 const at: usize = @intCast(try r.int(u64));

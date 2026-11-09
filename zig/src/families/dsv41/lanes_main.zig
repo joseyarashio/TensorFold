@@ -63,6 +63,8 @@ pub fn main(init: std.process.Init) !u8 {
     var profile = false;
     if (std.c.getenv("TF_DS_STREAMS")) |v| {
         o.streams = std.fmt.parseInt(usize, std.mem.span(v), 10) catch o.streams;
+    } else {
+        o.streams = 8;
     }
     if (std.c.getenv("TF_DS_ROUND_ROWS")) |v| {
         o.round_rows = std.fmt.parseInt(usize, std.mem.span(v), 10) catch o.round_rows;

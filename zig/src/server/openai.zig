@@ -401,18 +401,20 @@ const Run = struct {
             if (s.run.out.vt.ping) |p| return p(s.run.out.ctx);
         }
 
-        fn call(ctx: *anyopaque, delta: Value) error{Closed}!void {
+        fn call(ctx: *anyopaque, delta: Value) error{Closed}!bool {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
             const r = s.run;
             if (!s.tools) {
-                if (!r.is_chat and delta != .string) return; // completions stream text only
-                return r.emit(r.chunk(delta, null) catch return error.Closed);
+                if (!r.is_chat and delta != .string) return false; // completions stream text only
+                try r.emit(r.chunk(delta, null) catch return error.Closed);
+                return true;
             }
             const filtered = r.policyDelta(delta) catch return error.Closed;
-            const d = filtered orelse return;
+            const d = filtered orelse return false;
             try r.prose();
             r.prose_sent.appendSlice(r.a, if (d == .string) d.string else d.strField("content") orelse "") catch return error.Closed;
-            return r.emit(r.chunk(d, null) catch return error.Closed);
+            try r.emit(r.chunk(d, null) catch return error.Closed);
+            return true;
         }
     };
 
@@ -440,32 +442,51 @@ const Run = struct {
         return if (o.count() > 0) Value{ .object = o } else null;
     }
 
+    /// ``stands``: the client has a call it can read whole; ``matched``: every call that went out is the parse's.
+    const Settled = struct { stands: bool, matched: bool };
+
     /// The DSML calls a stream sent as they decoded, checked against the reply's parse. When the sent
     /// calls are the parse's first ones (same names, the same arguments byte for byte, each closed), the parse's other calls
     /// (another call form after the blocks) follow under the next indexes. Otherwise the parse dropped or changed what went
     /// out (the reply ended inside a block, the parse rejects an invoke, a repeated parameter): nothing more of the calls
     /// goes out, no brace closes what the parse rejects, and the content goes on to the parse's content.
-    fn settle(r: *Run, reply: *const chat.Reply, calls: ?[]Value) Allocator.Error!void {
+    fn settle(r: *Run, reply: *const chat.Reply, sent: []const tool_stream.SentCall, calls: ?[]Value) Allocator.Error!Settled {
         const a = r.a;
-        const sent = reply.streamed_calls;
         const parsed = calls orelse &.{};
+        var stands = false;
+        for (sent) |c| if (c.closed and !c.held) {
+            if (try json.parseText(a, c.arguments.items) == .ok) stands = true;
+        };
         var k: usize = 0;
         while (k < sent.len and k < parsed.len and sent[k].same(parsed[k])) k += 1;
         if (k == sent.len) {
             for (try tool_parse.deltas(a, parsed[k..])) |d| {
                 const one = d.get("tool_calls").?.array[0];
                 try one.object.put(a, "index", try json.intValue(a, k + @as(usize, @intCast(one.get("index").?.int64().?))));
-                r.emit(try r.chunk(d, null)) catch return;
+                r.emit(try r.chunk(d, null)) catch return .{ .stands = true, .matched = true };
+                stands = true;
             }
-            return;
+            return .{ .stands = stands, .matched = true };
         }
         log.line("warning: {s}: the streamed tool call {d} is not the reply's parse ({d} sent, {d} parsed); its content follows the parse", .{ r.id, k, sent.len, parsed.len });
-        const shown = reply_text.pyLstrip(r.prose_sent.items);
-        if (!std.mem.startsWith(u8, reply.content, shown)) return;
-        const rest = reply.content[shown.len..];
+        try r.contentRest(reply);
+        return .{ .stands = stands, .matched = false };
+    }
+
+    /// The parse's content past the prose that streamed, when it starts with that prose: a block the stream hid that the
+    /// parse keeps as text (one the reply never closed).
+    fn contentRest(r: *Run, reply: *const chat.Reply) Allocator.Error!void {
+        const sent = r.prose_sent.items;
+        const shown = reply_text.pyLstrip(sent); // a parsed content starts stripped
+        const rest = if (std.mem.startsWith(u8, reply.content, sent))
+            reply.content[sent.len..]
+        else if (std.mem.startsWith(u8, reply.content, shown))
+            reply.content[shown.len..]
+        else
+            return;
         if (reply_text.pyStrip(rest).len == 0) return;
         r.prose() catch return;
-        try r.prose_sent.appendSlice(a, rest);
+        try r.prose_sent.appendSlice(r.a, rest);
         r.emit(try r.chunk(.{ .string = rest }, null)) catch return;
     }
 
@@ -500,7 +521,7 @@ const Run = struct {
         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
         var sink_state: StreamSink = .{ .run = r, .tools = tools };
         handed = true;
-        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call, .ping = StreamSink.ping }, gone) catch |e| {
+        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call, .ping = StreamSink.ping, .calls_live = !r.plan.policy.single }, gone) catch |e| {
             switch (e) {
                 error.Cancelled => return,
                 error.Refused => if (cx.kind != .other and cx.kind != .server) {
@@ -521,7 +542,67 @@ const Run = struct {
             r.out.vt.event(r.out.ctx, null) catch {};
             return;
         };
-        if (tools) {
+        if (tools and reply.answer_deferred and r.srv.config.tool_stream == .live) {
+            // a block read past a closer inside a value: its calls complete, and the parse's later calls follow, only when
+            // the parse takes what went out; the rest of the answer as the live stream shows it, between the two
+            const ended = reply.finish_reason;
+            const raw = reply.content;
+            const calls = r.attachCalls(&reply) catch return;
+            const takes = tool_stream.parseTakes(reply.streamed_calls, calls orelse &.{});
+            if (takes) for (reply.withheld) |d| r.emit(r.chunk(d, null) catch return) catch return;
+            const view = reply_text.hideToolCalls(a, raw, true) catch return;
+            const shown = r.prose_sent.items;
+            // whitespace alone, before any prose and with calls made, stays held, as the live finish holds it
+            const blank = shown.len == 0 and reply_text.pyStrip(view).len == 0;
+            if (!blank and std.mem.startsWith(u8, view, shown) and view.len > shown.len) {
+                r.prose() catch return;
+                r.prose_sent.appendSlice(a, view[shown.len..]) catch return;
+                r.emit(r.chunk(.{ .string = view[shown.len..] }, null) catch return) catch return;
+            }
+            const settled = r.settle(&reply, if (takes) reply.streamed_calls else reply.wire_calls, calls) catch return;
+            if (!settled.stands or (!settled.matched and std.mem.eql(u8, ended, "length"))) reply.finish_reason = ended;
+            if (std.mem.eql(u8, ended, "length")) {
+                r.contentRest(&reply) catch return;
+                reply.finish_reason = ended;
+            }
+        } else if (tools and reply.answer_deferred) {
+            // the answer from its first call's opener on, held while the reply decoded, and its calls: the content and
+            // calls a whole reply gets, after the prose that streamed
+            const raw = reply.content; // the answer as the model wrote it; attachCalls makes it the parse's content
+            const calls = r.attachCalls(&reply) catch return;
+            const sent = r.prose_sent.items;
+            const shown = reply_text.pyLstrip(sent); // a parsed content starts stripped
+            const rest: ?[]const u8 = if (std.mem.startsWith(u8, reply.content, sent))
+                reply.content[sent.len..]
+            else if (std.mem.startsWith(u8, reply.content, shown))
+                reply.content[shown.len..]
+            else if (std.mem.startsWith(u8, shown, reply.content) and reply_text.pyStrip(shown[reply.content.len..]).len == 0)
+                "" // and ends stripped: the stream sent the whitespace it ends in
+            else
+                null;
+            // otherwise prose the content does not start with went out (markup the stream filter does not hide, or thinking
+            // off, a Harmony split of the text): the rest as the filter shows the answer, as such a stream went on before
+            const tail = rest orelse blk: {
+                const view = r.plan.policy.content(a, reply_text.hideToolCallsAtFirstCloser(a, raw, true) catch return) catch return;
+                log.line("warning: {s}: the streamed prose is not the start of the reply's content; the rest goes out as the stream filter shows it", .{r.id});
+                break :blk if (std.mem.startsWith(u8, view, sent)) view[sent.len..] else "";
+            };
+            if (tail.len > 0) {
+                r.prose() catch return;
+                r.prose_sent.appendSlice(a, tail) catch return;
+                r.emit(r.chunk(.{ .string = tail }, null) catch return) catch return;
+            }
+            if (calls) |cs| {
+                // the role first, as before calls streamed: a stream's calls are the same events at the reply's end
+                r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
+                const deltas = tool_parse.deltas(a, cs) catch return;
+                for (deltas) |d| r.emit(r.chunk(d, null) catch return) catch return;
+            }
+        } else if (tools) {
+            const ended = reply.finish_reason;
+            // hold mode finishes as 0065 first did; live, a reply the length cut ends as cut, whatever calls it made
+            const live = r.srv.config.tool_stream == .live;
+            const cut = live and std.mem.eql(u8, ended, "length");
             const calls = r.attachCalls(&reply) catch return;
             const tail = r.plan.policy.flush();
             if (tail.len > 0) {
@@ -530,15 +611,24 @@ const Run = struct {
                 r.emit(r.chunk(.{ .string = tail }, null) catch return) catch return;
             }
             if (!r.plan.policy.single and reply.streamed_calls.len > 0) {
-                r.settle(&reply, calls) catch return;
+                // the reply's own reason stands when the client has no whole call, or holds a call the parse rejects
+                // in a reply cut by the length
+                const settled = r.settle(&reply, reply.streamed_calls, calls) catch return;
+                if (live and (!settled.stands or (!settled.matched and std.mem.eql(u8, ended, "length")))) reply.finish_reason = ended;
             } else if (calls != null and !reply.tool_calls_streamed) {
                 r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
                 const deltas = tool_parse.deltas(a, calls.?) catch return;
                 for (deltas) |d| r.emit(r.chunk(d, null) catch return) catch return;
             } else if (reply.content.len > 0 and !r.streamed_prose) {
+                r.prose_sent.appendSlice(a, reply.content) catch return; // so the cut's recovery below sends none of it again
                 r.emit(r.chunk(.{ .string = reply.content }, null) catch return) catch return;
             } else if (r.plan.policy.kept(reply.content, r.prose_sent.items)) |rest| {
+                r.prose_sent.appendSlice(a, rest) catch return;
                 r.emit(r.chunk(.{ .string = rest }, null) catch return) catch return;
+            }
+            if (cut) {
+                r.contentRest(&reply) catch return;
+                reply.finish_reason = ended;
             }
         }
         const last = r.chunk(.{ .string = "" }, if (reply.finish_reason.len > 0) reply.finish_reason else "length") catch return;

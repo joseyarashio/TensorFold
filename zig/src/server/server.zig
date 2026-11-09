@@ -18,6 +18,7 @@ const prompt = @import("prompt.zig");
 const tool_specs = @import("tool_specs.zig");
 const chunk_plan = @import("chunk_plan.zig");
 const log = @import("log.zig");
+const tool_streaming = @import("tool_streaming.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -58,6 +59,7 @@ pub const Config = struct {
     /// Directory of the stored note, or null when notes are not stored.
     compact_memory: ?[]const u8 = null,
     timeouts: http_conn.Timeouts = .{},
+    tool_stream: tool_streaming.Mode = .live,
 };
 
 pub const Server = struct {

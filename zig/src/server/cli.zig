@@ -2,6 +2,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const api = @import("engine_api");
+const tool_streaming = @import("tool_streaming.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Kind = enum {
@@ -306,7 +307,7 @@ pub fn capabilities(w: *std.Io.Writer, e: Engines) !void {
         try w.writeAll("}");
     }
     try w.writeAll("}}, \"env\": [");
-    for (env, 0..) |name, i| try w.print("{s}\"{s}\"", .{ if (i > 0) ", " else "", name });
+    for (env ++ tool_streaming.env, 0..) |name, i| try w.print("{s}\"{s}\"", .{ if (i > 0) ", " else "", name });
     try w.writeAll("]}\n");
 }
 

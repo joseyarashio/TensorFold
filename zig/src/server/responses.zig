@@ -203,7 +203,13 @@ const Wire = struct {
     payload: Value = .null,
 
     fn out(w: *Wire) openai.Out {
-        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole } };
+        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .ping = ping } };
+    }
+
+    /// An SSE comment while the reply is silent (a long prefill, an answer held from its call's opener on).
+    fn ping(ctx: *anyopaque) error{Closed}!void {
+        const w: *Wire = @ptrCast(@alignCast(ctx));
+        return sse.comment(w.reply.conn, "ping");
     }
 
     fn open(ctx: *anyopaque) error{Closed}!void {
@@ -323,10 +329,13 @@ const Reply = struct {
     fn close(r: *Reply, status: []const u8) E!void {
         const item = r.current orelse return;
         r.current = null;
-        try r.put(item, "status", .{ .string = status });
+        const is_call = std.mem.eql(u8, item.get("type").?.string, "function_call");
+        // a call whose arguments are not a JSON object was cut, or the reply's parse rejected it after its header went out
+        const whole = !is_call or r.srv.config.tool_stream == .hold or if (json.parseText(r.a, item.get("arguments").?.string) catch null) |res| res == .ok and res.ok == .object else false;
+        try r.put(item, "status", .{ .string = if (whole) status else "incomplete" });
         const where_id = item.get("id").?;
         const where_index = try r.int(r.index(item));
-        if (std.mem.eql(u8, item.get("type").?.string, "function_call")) {
+        if (is_call) {
             try r.event("response.function_call_arguments.done", &.{ .{ "item_id", where_id }, .{ "output_index", where_index }, .{ "name", item.get("name").? }, .{ "arguments", item.get("arguments").? } });
         } else {
             const part = item.get("content").?.array[0].object;

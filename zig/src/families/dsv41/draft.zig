@@ -31,7 +31,7 @@ const Chunk = prompt.Chunk;
 /// MultiDecoder's stream slots in the served lane (--parallel 4): the pool's streams.
 pub const max_streams = 32; // the most streams any stream setting (Model.streams) gives the pool
 /// The served pool's streams when unset (--parallel 4); the four-node lane serves 16.
-pub const default_streams = 4;
+pub const default_streams = 8;
 /// A pass's rows at most: every stream's block (four streams: 20). Past kernels.decode_rows() (16 rows: four streams) the MoE gate is a
 /// cuBLAS matmul with the plain routing and the attention one split (its pick list padded to 16 columns of -1).
 pub const max_rows = max_streams * 5; // every stream of the pool, a five-row block each
@@ -446,7 +446,10 @@ pub const Drafter = struct {
         var hb: [max_rows * pick_pad]i64 = @splat(-1);
         const bw: usize = if (R > tri.decode_rows) pick_pad else n; // the pick list's columns
         for (0..N) |i| {
-            if (slots[i] < 0 or slots[i] >= pool.slots) return error.BadSlot;
+            if (slots[i] < 0 or slots[i] >= pool.slots) {
+                std.debug.print("[passSteps BadSlot] slots[{d}]={d} >= pool.slots={d}\n", .{ i, slots[i], pool.slots });
+                return error.BadSlot;
+            }
             for (0..n) |j| {
                 const r = i * n + j;
                 hv[0 * max_rows + r] = if (j == 0) tokens[i] else dr.noise;

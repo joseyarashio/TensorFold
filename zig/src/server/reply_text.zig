@@ -37,6 +37,150 @@ fn find(text: []const u8, tag: []const u8) ?usize {
     return findTag(text, 0, tag);
 }
 
+/// The invoke and parameter tags of a DSML spelling, by its block's opener (null: not a DSML block; V4.1's opener also
+/// with the two newlines ``calls`` lists it with). V4's parser requires a parameter's ``string`` attribute; V4.1's reads
+/// one when it is there.
+const Dsml = struct { invoke_open: []const u8, invoke_close: []const u8, param_open: []const u8, param_close: []const u8, attr_required: bool };
+
+fn dsmlTags(opener: []const u8) ?Dsml {
+    const D = "\u{ff5c}DSML\u{ff5c}";
+    if (std.mem.eql(u8, opener, "<" ++ D ++ " calls>") or std.mem.eql(u8, opener, "\n\n<" ++ D ++ " calls>")) return .{ .invoke_open = "<" ++ D ++ " invoke name=\"", .invoke_close = "</" ++ D ++ " invoke>", .param_open = "<" ++ D ++ " parameter name=\"", .param_close = "</" ++ D ++ " parameter>", .attr_required = false };
+    if (std.mem.eql(u8, opener, "<" ++ D ++ "tool_calls>")) return .{ .invoke_open = "<" ++ D ++ "invoke name=\"", .invoke_close = "</" ++ D ++ "invoke>", .param_open = "<" ++ D ++ "parameter name=\"", .param_close = "</" ++ D ++ "parameter>", .attr_required = true };
+    return null;
+}
+
+/// Whether every ``closer`` in an invoke's ``body`` lies inside a parameter value, as the parser reads values: from
+/// the ``>`` after a parameter's name (and ``string`` attribute) to the first parameter closer after it.
+fn closersInValues(body: []const u8, closer: []const u8, t: Dsml) bool {
+    var c = findTag(body, 0, closer);
+    var p: usize = 0;
+    while (c) |at| {
+        const ps = findTag(body, p, t.param_open) orelse return false;
+        p = ps + 1;
+        const ns = ps + t.param_open.len;
+        const nq = std.mem.indexOfScalarPos(u8, body, ns, '"') orelse continue;
+        if (!t.attr_required and nq == ns) continue;
+        var v = nq + 1;
+        if (std.mem.startsWith(u8, body[v..], " string=\"true\"")) {
+            v += " string=\"true\"".len;
+        } else if (std.mem.startsWith(u8, body[v..], " string=\"false\"")) {
+            v += " string=\"false\"".len;
+        } else if (t.attr_required) continue;
+        if (v >= body.len or body[v] != '>') continue;
+        v += 1;
+        const pe = findTag(body, v, t.param_close) orelse continue;
+        if (at < v) return false; // a closer before this value, outside any value
+        var next: ?usize = at;
+        while (next) |n| {
+            if (n >= pe) break;
+            next = findTag(body, n + closer.len, closer);
+        }
+        c = next;
+        p = pe + t.param_close.len;
+    }
+    return true;
+}
+
+/// Whether ``rest`` is a proper start of ``tag``: the tag may still be being written.
+fn begins(rest: []const u8, tag: []const u8) bool {
+    return rest.len < tag.len and std.mem.startsWith(u8, tag, rest);
+}
+
+const Walk = union(enum) { closer: usize, more, broken };
+
+/// Reads a DSML block from ``from`` (just past its opener) the way the parser reads it: invokes, each a name up to the
+/// first quote followed by ``">``, each running to the first invoke closer after it, with only whitespace between them.
+/// The block's closer is the first one met between invokes, so a closer or an opener inside a parameter value (a file
+/// about DSML) neither ends nor splits the block. ``more``: the text ends inside the block; ``broken``: something else
+/// appears, a name holds a tag, or an invoke holds the block's closer outside its values.
+fn walkDsml(text: []const u8, from: usize, t: Dsml, closer: []const u8, r: ?*WalkResume) Walk {
+    var p = if (r) |w| @max(from, w.p) else from;
+    while (true) {
+        if (r) |w| if (w.p != p) {
+            w.p = p;
+            w.e_from = 0;
+        };
+        while (p < text.len and isSpaceByte(text[p])) p += 1;
+        if (p >= text.len) return .more;
+        const rest = text[p..];
+        if (std.mem.startsWith(u8, rest, closer)) return .{ .closer = p };
+        if (!std.mem.startsWith(u8, rest, t.invoke_open)) return if (begins(rest, closer) or begins(rest, t.invoke_open)) .more else .broken;
+        const ns = p + t.invoke_open.len;
+        const q = std.mem.indexOfScalarPos(u8, text, ns, '"') orelse
+            return if (std.mem.indexOfScalar(u8, text[ns..], '<') != null) .broken else .more;
+        if (std.mem.indexOfScalar(u8, text[ns..q], '<') != null) return .broken;
+        if (q + 2 > text.len) return .more;
+        if (!std.mem.startsWith(u8, text[q..], "\">")) return .broken;
+        const e = findTag(text, @max(q + 2, if (r) |w| w.e_from else 0), t.invoke_close) orelse {
+            if (r) |w| w.e_from = @max(q + 2, text.len -| (t.invoke_close.len - 1));
+            return .more;
+        };
+        // the invoke may hold the block's closer only inside its parameter values (a file about DSML)
+        if (!closersInValues(text[q + 2 .. e], closer, t)) return .broken;
+        p = e + t.invoke_close.len;
+    }
+}
+
+/// How many invokes in ``region`` the parser reads whole: a name up to its quote, then ``">``, then the first invoke
+/// closer after it (``dsml41Calls``' reading, which skips any invoke that does not complete).
+fn wholeInvokes(region: []const u8, t: Dsml) usize {
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (findTag(region, pos, t.invoke_open)) |s| {
+        pos = s + 1;
+        const ns = s + t.invoke_open.len;
+        const q = std.mem.indexOfScalarPos(u8, region, ns, '"') orelse continue;
+        if (q == ns or !std.mem.startsWith(u8, region[q..], "\">")) continue;
+        const e = findTag(region, q + 2, t.invoke_close) orelse continue;
+        pos = e + t.invoke_close.len;
+        n += 1;
+    }
+    return n;
+}
+
+/// Where the call block opened before ``from`` closes: the index of its closer, or null while it may still close. A
+/// DSML block's string values are not escaped, so a value can hold the block's own closer (a file about DSML). A block
+/// that reads as the parser reads it (``walkDsml``) closes at the first closer between its invokes, not at one inside
+/// an invoke, but only when that reading gives the parser more whole invokes than the first-closer rule gives over the
+/// same text (that block and the blocks it would have been split into): otherwise, and in every other case (a block
+/// that does not read that way, a reply that ended inside one, Qwen's and Gemma's markup), the first closer closes it.
+/// While the reply streams, a DSML block still being written stays hidden.
+pub fn blockEnd(text: []const u8, from: usize, opener: []const u8, closer: []const u8, finished: bool) ?usize {
+    const first = findTag(text, from, closer) orelse return null; // with no closer every reading is undecided
+    const t = dsmlTags(opener) orelse return first;
+    return decide(text, from, opener, closer, finished, first, walkDsml(text, from, t, closer, null), t);
+}
+
+/// Where a walk stopped: the start of the invoke it reads (each invoke before it is whole, so it stays read as the text
+/// grows) and where the search for that invoke's closer goes on.
+pub const WalkResume = struct { p: usize = 0, e_from: usize = 0 };
+
+/// ``blockEnd`` while a reply streams (``finished`` false), its first closer ``first`` known, the walk resumed where the
+/// last call left it: a long value is read once, not once a round.
+pub fn blockEndResume(text: []const u8, from: usize, opener: []const u8, closer: []const u8, first: usize, r: *WalkResume) ?usize {
+    const t = dsmlTags(opener) orelse return first;
+    return decide(text, from, opener, closer, false, first, walkDsml(text, from, t, closer, r), t);
+}
+
+fn decide(text: []const u8, from: usize, opener: []const u8, closer: []const u8, finished: bool, first: ?usize, walk: Walk, t: Dsml) ?usize {
+    switch (walk) {
+        .closer => |at| {
+            if (first == null or at == first.?) return at;
+            // the first-closer rule over the same text: the block to the first closer, then each block it opens after it
+            var split = wholeInvokes(text[from..first.?], t);
+            var pos = first.? + closer.len;
+            while (findTag(text[0..at], pos, opener)) |o| {
+                const e = findTag(text, o + opener.len, closer) orelse break;
+                split += wholeInvokes(text[o + opener.len .. e], t);
+                pos = e + closer.len;
+            }
+            return if (wholeInvokes(text[from..at], t) > split) at else first;
+        },
+        .more => return if (finished) first else null,
+        .broken => return first,
+    }
+}
+
 pub fn isChannel(m: Markers) bool {
     return std.mem.eql(u8, m.close, channel_markers.close);
 }
@@ -99,20 +243,95 @@ pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers)
     return .{ .reasoning = text[0 .. text.len - held], .answer = "" };
 }
 
+/// Where the first tool-call block of ``text`` opens (any form of ``calls``), or null.
+pub fn firstCall(text: []const u8) ?usize {
+    var first: ?usize = null;
+    for (calls) |c| if (findTag(text, 0, c[0])) |at| {
+        if (first == null or at < first.?) first = at;
+    };
+    return first;
+}
+
 /// Hides tool-call blocks and partial opening tags while streaming, so calls arrive as deltas instead.
 pub fn hideToolCalls(a: Allocator, text: []const u8, finished: bool) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     return hideInto(a, &out, text, finished);
 }
 
+/// ``hideToolCalls`` with each block ended at its first closer, as the held stream's filter reads a reply.
+pub fn hideToolCallsAtFirstCloser(a: Allocator, text: []const u8, finished: bool) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    return hideWith(a, &out, text, finished, false, null);
+}
+
 /// ``hideToolCalls`` into ``out`` (cleared first); text without a call block comes back as a slice of ``text``.
 pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finished: bool) Allocator.Error![]const u8 {
+    return hideWith(a, out, text, finished, true, null);
+}
+
+/// What ``hideInto`` read of a streaming reply, for the next round to go on from: where each opener was found, or how far
+/// its search went, and each block's end once the text decides it (a decided end stays: ``blockEnd``'s decisions hold as
+/// the text grows), or how far the search for it went. A round then reads only the text the last one did not.
+pub const Hide = struct {
+    text: ?[*]const u8 = null, // the buffer read last: a round in another one starts over
+    len: usize = 0,
+    opens: std.ArrayList(Open) = .empty,
+    blocks: std.ArrayList(Block) = .empty,
+
+    const Open = struct { pos: usize, which: usize, from: usize, at: ?usize = null };
+    const Block = struct { start: usize, which: usize, close_from: usize, first: ?usize = null, walk: WalkResume = .{}, end: ?usize = null };
+
+    fn opener(h: *Hide, a: Allocator, text: []const u8, pos: usize, which: usize) Allocator.Error!?usize {
+        const o = for (h.opens.items) |*o| {
+            if (o.pos == pos and o.which == which) break o;
+        } else blk: {
+            try h.opens.append(a, .{ .pos = pos, .which = which, .from = pos });
+            break :blk &h.opens.items[h.opens.items.len - 1];
+        };
+        if (o.at) |at| return at;
+        const tag = calls[which][0];
+        o.at = findTag(text, o.from, tag);
+        if (o.at == null) o.from = @max(o.from, text.len -| (tag.len - 1));
+        return o.at;
+    }
+
+    fn end(h: *Hide, a: Allocator, text: []const u8, start: usize, which: usize) Allocator.Error!?usize {
+        const opener_tag = calls[which][0];
+        const closer = calls[which][1];
+        const b = for (h.blocks.items) |*b| {
+            if (b.start == start and b.which == which) break b;
+        } else blk: {
+            try h.blocks.append(a, .{ .start = start, .which = which, .close_from = start + opener_tag.len });
+            break :blk &h.blocks.items[h.blocks.items.len - 1];
+        };
+        if (b.end) |e| return e;
+        if (b.first == null) {
+            b.first = findTag(text, b.close_from, closer);
+            if (b.first == null) {
+                b.close_from = @max(b.close_from, text.len -| (closer.len - 1));
+                return null;
+            }
+        }
+        b.end = blockEndResume(text, start + opener_tag.len, opener_tag, closer, b.first.?, &b.walk);
+        return b.end;
+    }
+};
+
+/// ``hideInto`` while a reply streams, its text grown in place since the last round (a shorter one, or one in another
+/// buffer, starts over), going on from what ``h`` holds of the rounds before.
+pub fn hideIntoResume(a: Allocator, out: *std.ArrayList(u8), text: []const u8, h: *Hide) Allocator.Error![]const u8 {
+    if (text.len < h.len or h.text != text.ptr) h.* = .{ .text = text.ptr };
+    h.len = text.len;
+    return hideWith(a, out, text, false, true, h);
+}
+
+fn hideWith(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finished: bool, read_values: bool, h: ?*Hide) Allocator.Error![]const u8 {
     out.clearRetainingCapacity();
     var pos: usize = 0;
     while (true) {
         var start: ?usize = null;
         var which: usize = 0;
-        for (calls, 0..) |c, i| if (findTag(text, pos, c[0])) |at| {
+        for (calls, 0..) |c, i| if (if (h) |r| try r.opener(a, text, pos, i) else findTag(text, pos, c[0])) |at| {
             if (start == null or at < start.?) {
                 start = at;
                 which = i;
@@ -130,7 +349,8 @@ pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finishe
         }
         try out.appendSlice(a, text[pos..start.?]);
         const opener = calls[which][0];
-        const end = findTag(text, start.? + opener.len, calls[which][1]) orelse return out.items;
+        const from = start.? + opener.len;
+        const end = (if (!read_values) findTag(text, from, calls[which][1]) else if (h) |r| try r.end(a, text, start.?, which) else blockEnd(text, from, opener, calls[which][1], finished)) orelse return out.items;
         pos = end + calls[which][1].len;
     }
 }

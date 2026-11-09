@@ -36,15 +36,18 @@ pub const Input = struct {
     images: []const []const u8 = &.{},
 };
 
-/// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
+/// A streamed piece: content text (a string) or a delta object (reasoning or tool calls). ``call`` says whether the
+/// client got anything (its route can filter a delta away).
 pub const Sink = struct {
     ctx: *anyopaque,
-    call: *const fn (ctx: *anyopaque, delta: Value) error{Closed}!void,
+    call: *const fn (ctx: *anyopaque, delta: Value) error{Closed}!bool,
     ping: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
+    calls_live: bool = true, // the route sends DSML call deltas as they come (the one-call policy drops them)
 };
 
-/// How long a streaming reply may be silent before a sink that has a ping gets one (a long cold prefill).
-const ping_after_ns: i96 = 25 * std.time.ns_per_s;
+/// How long a streaming reply may be silent before a sink that has a ping gets one (a long cold prefill, a call's value
+/// waiting past a closer inside it). A test lowers it.
+pub var ping_after_ns: i96 = 25 * std.time.ns_per_s;
 
 pub const Reply = struct {
     content: []const u8,
@@ -53,6 +56,14 @@ pub const Reply = struct {
     tool_calls_streamed: bool,
     /// The DSML calls a stream sent as they decoded, for the finish to check against the parse.
     streamed_calls: []const tool_stream.SentCall = &.{},
+    /// A stream with tools held its answer from the first call's opener on (TENSORFOLD_TOOL_STREAM=hold): the route sends
+    /// the rest of the answer and its calls as the reply's parse settles them, the content and calls a whole reply gets.
+    /// Live, the answer from the end of a block read past a closer inside a value (``withheld``) waits the same way.
+    answer_deferred: bool = false,
+    /// Live, a block read past a closer inside a value: what completes its calls, sent only if the parse takes them, and
+    /// the calls the client has if it never goes out.
+    withheld: []const Value = &.{},
+    wire_calls: []const tool_stream.SentCall = &.{},
     finish_reason: []const u8,
     prompt_tokens: usize,
     cached_tokens: usize,
@@ -326,9 +337,16 @@ const Generation = struct {
     token_ids: bool = false, // the request asked for its ids back (Input.token_ids)
     visible: reply_text.Incremental = .{},
     hidden: std.ArrayList(u8) = .empty, // reused for the answer without its call blocks
+    hide: reply_text.Hide = .{}, // what the stream filter read of the answer in the rounds before
+    answer_at: ?[*]const u8 = null, // the answer's buffer last round: the searches below go on only in the same one
+    answer_len: usize = 0,
+    channel_from: usize = 0, // where the search for a Harmony marker in the answer goes on
+    dsml_from: usize = 0, // where the search for the answer's first DSML opener goes on
+    dsml_at: ?usize = null, // the answer's first DSML opener, once found
     streamed: Shown = .{}, // what content streamed, kept apart from the decode buffer that grows under slices
     streamed_reasoning: Shown = .{},
     streaming_done: bool = false,
+    held: bool = false, // hold mode: the answer from its first call's opener on waits for the reply's end (Reply.answer_deferred)
     first_ns: ?i96 = null,
     last_ns: ?i96 = null,
     reason: ?[]const u8 = null, // the server ended the reply (a stop string, the length) before the engine said so
@@ -398,7 +416,18 @@ const Generation = struct {
             }
             answer = split.answer;
         }
-        const shown = if (g.calls != null) try reply_text.hideInto(g.a, &g.hidden, answer, false) else answer;
+        if (g.calls != null and (g.held or (g.srv.config.tool_stream == .hold and reply_text.firstCall(answer) != null))) {
+            g.held = true;
+            return;
+        }
+        if (answer.ptr != g.answer_at or answer.len < g.answer_len) {
+            g.channel_from = 0;
+            g.dsml_from = 0;
+            g.dsml_at = null;
+        }
+        g.answer_at = answer.ptr;
+        g.answer_len = answer.len;
+        const shown = if (g.calls != null) try reply_text.hideIntoResume(g.a, &g.hidden, answer, &g.hide) else answer;
         const visible_content = reply_text.streamingVisible(shown);
         // Hold leading whitespace while a tool-only reply is still possible; later prose sends it intact.
         const vis = if (g.calls != null and g.streamed.text.items.len == 0 and
@@ -407,13 +436,17 @@ const Generation = struct {
         if (g.calls) |*c| {
             // thinking off, the finish reads Harmony channels out of a text that holds their marker, so its parse no
             // longer reads this answer: the DSML streamer stops, and the finish follows the parse
-            if (!g.thinking and std.mem.indexOf(u8, answer, "<|channel|>") != null) c.dsml.off = true;
+            if (!g.thinking) {
+                if (std.mem.indexOfPos(u8, answer, g.channel_from, "<|channel|>") != null) c.dsml.off = true;
+                g.channel_from = @max(g.channel_from, answer.len -| ("<|channel|>".len - 1));
+            }
             // a block under way ends before this round's prose, which can only come after it: a text delta between a
             // call's header and its last piece ends that call for a client (LiteLLM's Messages stream, /v1/responses)
             if (c.dsml.midCall()) {
                 var early: std.ArrayList(Value) = .empty;
                 try c.feedDsmlBlock(answer, &early);
                 for (early.items) |d| try g.emit(sink, d);
+                if (g.deferCalls(sink)) return;
             }
         }
         const delta = g.streamed.after(vis, !copied);
@@ -423,17 +456,54 @@ const Generation = struct {
         }
         if (g.calls) |*c| {
             var out: std.ArrayList(Value) = .empty;
-            try c.feed(tool_parse.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
+            try c.feed(g.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
             try c.feedDsml(answer, &out); // DeepSeek-V4.1's DSML calls as they decode, never the reasoning
             for (out.items) |d| try g.emit(sink, d);
+            _ = g.deferCalls(sink);
         }
     }
 
+    /// The streamer withheld a block's completion (``Dsml.deferred``): the rest of the answer waits for the reply's end, so
+    /// no prose goes out between a call's pieces and what completes it. The one-call policy sends no call deltas.
+    fn deferCalls(g: *Generation, sink: Sink) bool {
+        const c = &(g.calls orelse return false);
+        if (!c.dsml.deferred or !sink.calls_live) return false;
+        g.held = true;
+        return true;
+    }
+
+    /// ``tool_parse.beforeDsml`` of an answer that grows in place round by round: an opener found stays the first one.
+    fn beforeDsml(g: *Generation, answer: []const u8) []const u8 {
+        if (g.dsml_at == null) {
+            const v41 = std.mem.indexOfPos(u8, answer, g.dsml_from, tool_parse.dsml41_open);
+            const v4 = std.mem.indexOfPos(u8, answer, g.dsml_from, tool_parse.dsml_open);
+            g.dsml_at = if (v41 != null and v4 != null) @min(v41.?, v4.?) else v41 orelse v4;
+            if (g.dsml_at == null) g.dsml_from = answer.len -| (@max(tool_parse.dsml41_open.len, tool_parse.dsml_open.len) - 1);
+        }
+        return answer[0 .. g.dsml_at orelse answer.len];
+    }
+
     fn emit(g: *Generation, sink: Sink, delta: Value) Failure!void {
-        sink.call(sink.ctx, delta) catch {
+        const sent = sink.call(sink.ctx, delta) catch {
             g.cancel();
             return error.Cancelled;
         };
+        // what the client heard last: a delta its route filtered away, and rounds that send nothing (a value waiting past
+        // a closer inside it), count as silence
+        if (sent) g.last_out_ns = nowNs(g.srv.io);
+    }
+
+    /// A ping when the client heard nothing for ``ping_after_ns``.
+    fn keepAlive(g: *Generation) Failure!void {
+        const sink = g.sink orelse return;
+        const ping = sink.ping orelse return;
+        const now = nowNs(g.srv.io);
+        if (now - g.last_out_ns <= ping_after_ns) return;
+        ping(sink.ctx) catch {
+            g.cancel();
+            return error.Cancelled;
+        };
+        g.last_out_ns = now;
     }
 
     /// Ends the request and waits for the engine; one it ended unfinished counts as a disconnect, as the Mac scheduler counts it.
@@ -479,20 +549,11 @@ const Generation = struct {
                 return error.Cancelled;
             }
             const tokens = chunk orelse {
-                if (g.sink) |sink| if (sink.ping) |ping| {
-                    const now = nowNs(g.srv.io);
-                    if (now - g.last_out_ns > ping_after_ns) {
-                        ping(sink.ctx) catch {
-                            g.cancel();
-                            return error.Cancelled;
-                        };
-                        g.last_out_ns = now;
-                    }
-                };
+                try g.keepAlive();
                 continue;
             };
             if (g.reason == null) try g.commit(tokens);
-            g.last_out_ns = nowNs(g.srv.io);
+            try g.keepAlive(); // rounds keep coming while a value waits past a closer inside it
         }
     }
 
@@ -525,10 +586,14 @@ const Generation = struct {
             content = h.content;
             reasoning = h.reasoning;
         }
-        if (g.sink) |sink| {
+        if (g.sink) |sink| emit: {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
+            // a call's opener the live rounds did not show (a stop string's start held it back): held as well. Thinking
+            // off, the streamers below read the text before the Harmony split, so that text says
+            if (g.calls != null and g.srv.config.tool_stream == .hold and reply_text.firstCall(if (g.thinking) content else text) != null) g.held = true;
+            if (g.held) break :emit; // the rest of the answer and its calls: the route, from the parse (Reply.answer_deferred)
             var shown = if (g.calls != null) try reply_text.hideToolCalls(a, content, true) else content;
             // Drop held whitespace only after a real call parsed; whitespace-only answers are still sent.
             if (g.calls != null and g.streamed.text.items.len == 0 and reply_text.pyStrip(shown).len == 0) {
@@ -546,8 +611,11 @@ const Generation = struct {
                     for (early.items) |d| try g.emit(sink, d);
                 }
             };
+            if (g.deferCalls(sink)) break :emit;
             if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) try g.emit(sink, .{ .string = shown[sent.len..] });
-            if (g.calls) |*c| if (close.len > 0 and c.dsml.released == 0) {
+            // thinking off, the parse reads the final Harmony channel: a call only the text outside it holds is none
+            const channels = g.srv.config.tool_stream == .live and !g.thinking and std.mem.indexOf(u8, text, "<|channel|>") != null;
+            if (g.calls) |*c| if (close.len > 0 and c.dsml.released == 0 and !channels) {
                 // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas (after
                 // DSML calls went out, the finish's check sends such a call under the next index instead)
                 var out: std.ArrayList(Value) = .empty;
@@ -561,6 +629,7 @@ const Generation = struct {
                 try c.feedDsml(content, &out);
                 for (out.items) |d| try g.emit(sink, d);
             };
+            _ = g.deferCalls(sink);
         }
         const prefilled = m.prefilled_ns;
         const total = seconds(finished_ns - submitted);
@@ -610,6 +679,9 @@ const Generation = struct {
             .reasoning = reasoning,
             .tool_calls_streamed = g.calls != null and g.calls.?.streamed,
             .streamed_calls = if (g.calls) |*c| c.dsml.streamed() else &.{},
+            .answer_deferred = g.held,
+            .withheld = if (g.calls) |*c| c.dsml.withheld.items else &.{},
+            .wire_calls = if (g.calls) |*c| try c.dsml.wire(a) else &.{},
             .finish_reason = reason,
             .prompt_tokens = prompt_len,
             .cached_tokens = m.cached orelse 0,

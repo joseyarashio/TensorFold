@@ -44,3 +44,32 @@ pub fn wrapCalls(a: Allocator, one: Value) Allocator.Error!Value {
     try delta.put(a, "tool_calls", .{ .array = list });
     return .{ .object = delta };
 }
+
+/// The variable that picks how a stream with tools sends its calls (serve.zig reads it; capabilities lists it).
+pub const env = [_][]const u8{"TENSORFOLD_TOOL_STREAM"};
+
+/// ``live``: DSML calls go out as they decode, a value past a closer inside it once the text says where its block ends.
+/// ``hold``: from the first call's opener on, the content and the calls go out when the reply ends, as the whole reply's
+/// parse gives them, so a cut or misformatted call never reaches the client.
+pub const Mode = enum { live, hold };
+
+/// TENSORFOLD_TOOL_STREAM: unset, empty or blank is ``live``; else ``live`` or ``hold`` exactly (surrounding whitespace
+/// ignored), Invalid for anything else.
+pub fn mode(value: ?[]const u8) error{Invalid}!Mode {
+    const v = std.mem.trim(u8, value orelse "", " \t\r\n");
+    if (v.len == 0) return .live;
+    return std.meta.stringToEnum(Mode, v) orelse error.Invalid;
+}
+
+test "TENSORFOLD_TOOL_STREAM: live by default, live or hold, anything else refused" {
+    try std.testing.expectEqual(Mode.live, try mode(null));
+    try std.testing.expectEqual(Mode.live, try mode(""));
+    try std.testing.expectEqual(Mode.live, try mode(" live\n"));
+    try std.testing.expectEqual(Mode.hold, try mode("hold"));
+    try std.testing.expectError(error.Invalid, mode("Hold"));
+    try std.testing.expectError(error.Invalid, mode("1"));
+    try std.testing.expectEqual(Mode.live, try mode(" \t\n"));
+    try std.testing.expectEqual(Mode.hold, try mode(" hold "));
+    try std.testing.expectError(error.Invalid, mode("HOLD"));
+    try std.testing.expectError(error.Invalid, mode("live hold"));
+}

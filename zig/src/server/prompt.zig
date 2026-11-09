@@ -82,6 +82,7 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []
             error.OutOfMemory => return error.OutOfMemory,
             error.BadImage => return cx.refuse(problem),
         };
+        if (prep.tokens == 0) return cx.refuse("image input: a picture gave no tokens");
         try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
         try out.appendNTimes(cx.a, vision.token, prep.tokens);
         try spellImage(cx.a, &key, prep.payload, prep.tokens);

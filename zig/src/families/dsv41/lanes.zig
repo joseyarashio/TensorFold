@@ -446,8 +446,9 @@ pub const Lanes = struct {
             p.prefill += m.now() - t0;
         };
         if (self.fill) |f| if (f.s != s) {
-            // a prompt cuts in between this pass's pieces: it waits (one at most, no images), its next piece resumes it
-            if (self.paused != null or f.s.images.len > 0 or s.images.len > 0) return error.FillBusy;
+            // a prompt cuts in between this pass's pieces: it waits (one at most; neither pass needs picture rows: a cut-in's
+            // pictures wholly before the state it resumes run no tower and set no spans), its next piece resumes it
+            if (self.paused != null or f.s.images.len > 0 or lanes.Engine.picturesPast(s.images, s.reuse.at)) return error.FillBusy;
             self.paused = f;
             self.fill = null;
         };
@@ -544,6 +545,13 @@ pub const Lanes = struct {
             } else s.reuse_failed = true;
         }
         const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
+        if (s.cut_in > 0) {
+            const resume_at: usize = if (kept) |sn| (if (moved and sn.stale) 0 else sn.at) else 0;
+            if (len - resume_at > s.cut_in or lanes.Engine.picturesPast(s.images, resume_at)) {
+                std.log.info("dsv41: a cut-in of {d} tokens resumes at {d}, not at {d} as admitted; it waits for the pass in pieces", .{ len, resume_at, s.reuse.at });
+                return error.FillBusy;
+            }
+        }
         if (kept) |sn| {
             sn.wanted = 0;
             if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held

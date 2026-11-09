@@ -158,6 +158,7 @@ pub const Stream = struct {
     loop_period: ?u32 = null,
     chunks: []const u32,
     reuse: Reuse = .{},
+    cut_in: u32 = 0,
     images: []const Image = &.{},
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0

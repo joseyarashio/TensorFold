@@ -3,7 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 /// One state on disk: the tokens it read (position plus lookahead), the chunk starts below it, and its bytes.
-pub const Meta = struct { key: u64, at: u32, tokens: []u32, starts: []u32, bytes: u64, used: u64 = 0 };
+pub const Meta = struct { key: u64, at: u32, tokens: []u32, starts: []u32, bytes: u64, used: u64 = 0, last: i64 = 0 };
 
 const MAGIC: u32 = 0x494d5052; // "IMPR"
 const VERSION: u32 = 2;
@@ -17,6 +17,7 @@ pub const Imprint = struct {
     others: u64 = 0, // bytes other identities under `root` still hold
     metas: std.ArrayList(Meta) = .empty,
     clock: u64 = 0, // a meta's `used`: the clock at its last write or read
+    ttl: i64 = 0, // seconds a state may go unread before `expire` forgets it (0: no limit)
 
     /// The states learned under `identity` in `root` (made when missing); other identities past `cap` go, oldest first.
     pub fn open(gpa: Allocator, root: []const u8, identity: u64, cap: u64) !Imprint {
@@ -56,6 +57,84 @@ pub const Imprint = struct {
 
     pub fn has(m: *const Imprint, key: u64) bool {
         return m.find(key) != null;
+    }
+
+    /// The index's bytes and last uses set from the state files themselves (<16 hex key>.<anything> in `dir`): an index
+    /// written by an older build counted only part of a state's bytes. A state with no file left is dropped (its record
+    /// goes at the next index rewrite). Returns how many were dropped.
+    pub fn reprobe(m: *Imprint) !usize {
+        var seen: std.AutoHashMapUnmanaged(u64, FileUse) = .empty;
+        defer seen.deinit(m.gpa);
+        try scanStates(m.gpa, m.dir, &seen);
+        var gone: usize = 0;
+        var i: usize = 0;
+        while (i < m.metas.items.len) {
+            const x = &m.metas.items[i];
+            if (seen.get(x.key)) |u| {
+                x.bytes = u.bytes;
+                x.last = u.last;
+                i += 1;
+            } else {
+                free(m.gpa, m.metas.orderedRemove(i));
+                gone += 1;
+            }
+        }
+        return gone;
+    }
+
+    /// State `key`'s bytes on disk now (every file of its own in `dir`), 0 when it has none.
+    pub fn diskBytes(m: *const Imprint, key: u64) u64 {
+        const d = std.c.opendir(m.dir) orelse return 0;
+        defer _ = std.c.closedir(d);
+        var buf: [1400]u8 = undefined;
+        var n: u64 = 0;
+        while (std.c.readdir(d)) |ent| {
+            const name = std.mem.sliceTo(&ent.name, 0);
+            if ((stateKey(name) orelse continue) != key) continue;
+            const f = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ m.dir, name }, 0) catch continue;
+            var sx: std.os.linux.Statx = undefined;
+            if (std.os.linux.errno(std.os.linux.statx(std.os.linux.AT.FDCWD, f, 0, .{ .SIZE = true }, &sx)) == .SUCCESS) n += sx.size;
+        }
+        return n;
+    }
+
+    /// The least recently used states, oldest first, whose bytes leave room for `bytes` more under the cap (`keep` never).
+    pub fn victims(m: *const Imprint, gpa: Allocator, bytes: u64, keep: u64) ![]u64 {
+        var out: std.ArrayList(u64) = .empty;
+        errdefer out.deinit(gpa);
+        var held = m.others + m.total() + bytes;
+        if (held <= m.cap) return out.toOwnedSlice(gpa);
+        const order = try gpa.alloc(usize, m.metas.items.len);
+        defer gpa.free(order);
+        for (order, 0..) |*o, i| o.* = i;
+        std.mem.sort(usize, order, m.metas.items, struct {
+            fn older(xs: []const Meta, a: usize, b: usize) bool {
+                return xs[a].used < xs[b].used;
+            }
+        }.older);
+        for (order) |i| {
+            if (held <= m.cap) break;
+            const x = m.metas.items[i];
+            if (x.key == keep) continue;
+            try out.append(gpa, x.key);
+            held -|= x.bytes;
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// Set state `key`'s recorded bytes (after its family wrote it and the real size is known).
+    pub fn setBytes(m: *Imprint, key: u64, bytes: u64) void {
+        const i = m.find(key) orelse return;
+        m.metas.items[i].bytes = bytes;
+    }
+
+    /// The keys of states unread for more than `ttl` seconds at `now` (unix seconds), oldest first; caller frees.
+    pub fn expired(m: *const Imprint, gpa: Allocator, now: i64) ![]u64 {
+        var out: std.ArrayList(u64) = .empty;
+        errdefer out.deinit(gpa);
+        if (m.ttl <= 0) return out.toOwnedSlice(gpa);
+        for (m.metas.items) |x| if (x.last > 0 and now - x.last > m.ttl) try out.append(gpa, x.key);
+        return out.toOwnedSlice(gpa);
     }
 
     /// The bytes of every state learned under this identity.
@@ -98,6 +177,8 @@ pub const Imprint = struct {
         const i = m.find(key) orelse return;
         m.clock += 1;
         m.metas.items[i].used = m.clock;
+        m.metas.items[i].last = nowSeconds();
+        touchFiles(m.dir, key); // the last use survives a restart: the files' atime
     }
 
     /// Record a state its family has written (`bytes` on this Mac): an index record, fsynced, then the entry.
@@ -115,13 +196,28 @@ pub const Imprint = struct {
         const s = try m.gpa.dupe(u32, below);
         errdefer m.gpa.free(s);
         m.clock += 1;
-        try m.metas.append(m.gpa, .{ .key = key, .at = at, .tokens = t, .starts = s, .bytes = bytes, .used = m.clock });
+        try m.metas.append(m.gpa, .{ .key = key, .at = at, .tokens = t, .starts = s, .bytes = bytes, .used = m.clock, .last = nowSeconds() });
+    }
+
+    /// Forget states `keys`: the index is rewritten once without them (their family removes the files).
+    pub fn removeMany(m: *Imprint, keys: []const u64) !void {
+        var any = false;
+        for (keys) |key| if (m.find(key)) |i| {
+            free(m.gpa, m.metas.orderedRemove(i));
+            any = true;
+        };
+        if (any) try m.rewrite();
     }
 
     /// Forget state `key`: the index is rewritten without it (its family removes the files).
     pub fn remove(m: *Imprint, key: u64) !void {
         const i = m.find(key) orelse return;
         free(m.gpa, m.metas.orderedRemove(i));
+        try m.rewrite();
+    }
+
+    /// The index rewritten from the states in memory (atomically: index.part, fsync, rename).
+    pub fn rewrite(m: *Imprint) !void {
         var path: [1100]u8 = undefined;
         var part: [1100]u8 = undefined;
         const tmp = try std.fmt.bufPrintSentinel(&part, "{s}/index.part", .{m.dir}, 0);
@@ -179,6 +275,13 @@ pub const Imprint = struct {
         writeWord(std.fmt.bufPrintSentinel(&used, "{s}/used", .{m.dir}, 0) catch return, now);
     }
 };
+
+/// Wall-clock unix seconds (a learned state's last use outlives the process; the monotonic clock does not).
+pub fn nowSeconds() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+    return @intCast(ts.sec);
+}
 
 /// One index record: its head, its tokens, then the chunk starts below its position.
 fn record(fd: c_int, key: u64, at: u32, tokens: []const u32, starts: []const u32, bytes: u64) !void {
@@ -323,6 +426,49 @@ fn makePath(gpa: Allocator, dir: [:0]const u8) !void {
     };
     const rc = std.c.mkdir(tmp.ptr, 0o700);
     if (rc != 0 and std.c.errno(rc) != .EXIST) return error.ImprintDir;
+}
+
+const FileUse = struct { bytes: u64, last: i64 };
+
+/// Whether `name` is a state file: 16 hex digits, then a dot.
+fn stateKey(name: []const u8) ?u64 {
+    if (name.len < 17 or name[16] != '.') return null;
+    return std.fmt.parseInt(u64, name[0..16], 16) catch null;
+}
+
+/// Every state file in `dir`, by key: their bytes summed and the latest of their mtimes and atimes.
+fn scanStates(gpa: Allocator, dir: [:0]const u8, out: *std.AutoHashMapUnmanaged(u64, FileUse)) !void {
+    const d = std.c.opendir(dir) orelse return;
+    defer _ = std.c.closedir(d);
+    var buf: [1400]u8 = undefined;
+    while (std.c.readdir(d)) |ent| {
+        if (ent.type != std.c.DT.REG) continue;
+        const name = std.mem.sliceTo(&ent.name, 0);
+        const key = stateKey(name) orelse continue;
+        const f = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0) catch continue;
+        var sx: std.os.linux.Statx = undefined;
+        if (std.os.linux.errno(std.os.linux.statx(std.os.linux.AT.FDCWD, f, 0, .{ .SIZE = true, .ATIME = true, .MTIME = true }, &sx)) != .SUCCESS) continue;
+        const last: i64 = @max(sx.atime.sec, sx.mtime.sec);
+        const g = try out.getOrPut(gpa, key);
+        if (g.found_existing) {
+            g.value_ptr.bytes += sx.size;
+            g.value_ptr.last = @max(g.value_ptr.last, last);
+        } else g.value_ptr.* = .{ .bytes = sx.size, .last = last };
+    }
+}
+
+/// State `key`'s files read now: their atime set (mtime kept), so its last use outlives the process.
+fn touchFiles(dir: [:0]const u8, key: u64) void {
+    const d = std.c.opendir(dir) orelse return;
+    defer _ = std.c.closedir(d);
+    var buf: [1400]u8 = undefined;
+    const times = [2]std.c.timespec{ std.os.linux.UTIME.NOW, std.os.linux.UTIME.OMIT };
+    while (std.c.readdir(d)) |ent| {
+        const name = std.mem.sliceTo(&ent.name, 0);
+        if ((stateKey(name) orelse continue) != key) continue;
+        const f = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0) catch continue;
+        _ = std.c.utimensat(std.os.linux.AT.FDCWD, f, &times, 0);
+    }
 }
 
 test {

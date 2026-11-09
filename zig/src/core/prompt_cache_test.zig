@@ -494,3 +494,91 @@ test "past the learned-state cap the least recently used state is forgotten, and
     try std.testing.expectEqual(fresh(&p3), g.pass(&t, &p3, plan));
     try std.testing.expect(im.has(imprint.Imprint.keyOf(&two))); // learned again by that pass
 }
+
+/// A learned family whose files are 10x what `bytes` says (DeepSeek's compressed plane is not in `bytes`).
+const Big = struct {
+    fn snapshots(f: *Fake) Snapshots {
+        return .{ .ptr = f, .vtable = &.{ .bytes = Fake.bytesFn, .save = Fake.saveFn, .restore = Fake.restoreFn, .drop = Fake.dropFn, .write = writeFn, .read = Fake.readFn, .forget = Fake.forgetFn } };
+    }
+    fn writeFn(ptr: *anyopaque, saved: Saved, dir: [:0]const u8, key: u64) anyerror!void {
+        try Fake.writeFn(ptr, saved, dir, key);
+        var path: [512]u8 = undefined;
+        const fd = std.c.open(try std.fmt.bufPrintSentinel(&path, "{s}/{x:0>16}.pad", .{ dir, key }, 0), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        if (fd < 0) return error.WriteFailed;
+        defer _ = std.c.close(fd);
+        const zeros: [1000]u8 = @splat(0);
+        try imprint.writeAll(fd, &zeros);
+    }
+};
+
+test "the learned-state cap counts the bytes on disk, not the family's estimate" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/tf-learn-disk-{d}", .{std.c.getpid()});
+    defer rmTree(root);
+    const rules: pc.Rules = .{ .lookahead = 1, .min_prompt = 0, .min_gap = 1 };
+    var im = try imprint.Imprint.open(gpa, root, 3, 2500); // an estimate of 105 would fit 23; a real ~1016 fits 2
+    defer im.deinit();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, Big.snapshots(&f), rules, 1 << 20);
+    defer s.deinit();
+    s.imprint = &im;
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        const harness = [_]u32{ 20 + i, 7, 7, 7, 7, 7 };
+        const p = harness ++ [_]u32{ 1, 9 };
+        _ = f.pass(&s, &p, try s.begin(a, &p, 7, &.{5}, &.{}, null));
+    }
+    try std.testing.expect(im.total() <= im.cap);
+    try std.testing.expectEqual(@as(usize, 2), im.metas.items.len);
+    try std.testing.expect(im.total() >= 2000); // the real bytes
+    try std.testing.expectEqual(@as(u64, 3), s.learned_forgotten);
+}
+
+test "a learned state unread past the ttl is forgotten with its files, and a fresh pass learns it again" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/tf-learn-ttl-{d}", .{std.c.getpid()});
+    defer rmTree(root);
+    const rules: pc.Rules = .{ .lookahead = 1, .min_prompt = 0, .min_gap = 1 };
+    const harness = [_]u32{ 7, 7, 7, 7, 7, 7 };
+    const key = imprint.Imprint.keyOf(&harness);
+    var im = try imprint.Imprint.open(gpa, root, 3, 1 << 30);
+    defer im.deinit();
+    im.ttl = 3600;
+    {
+        var f: Fake = .{ .gpa = gpa };
+        var s = Store.init(gpa, f.learned(), rules, 1 << 20);
+        defer s.deinit();
+        s.imprint = &im;
+        const first = harness ++ [_]u32{ 1, 2, 9 };
+        _ = f.pass(&s, &first, try s.begin(a, &first, 8, &.{5}, &.{}, null));
+        try std.testing.expect(im.has(key));
+    }
+    { // two hours unread: the file's times say so (the startup pass reads them, as after a restart)
+        var path: [512]u8 = undefined;
+        const ago: std.c.timespec = .{ .sec = imprint.nowSeconds() - 7200, .nsec = 0 };
+        const times = [2]std.c.timespec{ ago, ago };
+        try std.testing.expectEqual(@as(c_int, 0), std.c.utimensat(std.os.linux.AT.FDCWD, try Fake.file(&path, im.dir, key), &times, 0));
+    }
+    var g: Fake = .{ .gpa = gpa };
+    var t = Store.init(gpa, g.learned(), rules, 1 << 20);
+    defer t.deinit();
+    t.imprint = &im;
+    const st = t.settleLearned();
+    try std.testing.expectEqual(@as(usize, 1), st.expired);
+    try std.testing.expect(!im.has(key));
+    var path: [512]u8 = undefined;
+    try std.testing.expect(std.c.unlink(try Fake.file(&path, im.dir, key)) != 0); // its file went too
+    const second = harness ++ [_]u32{ 3, 4, 9 };
+    const plan = try t.begin(a, &second, 8, &.{5}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 0), plan.from); // nothing on disk: a fresh pass
+    try std.testing.expectEqual(fresh(&second), g.pass(&t, &second, plan));
+    try std.testing.expect(im.has(key)); // learned again
+}

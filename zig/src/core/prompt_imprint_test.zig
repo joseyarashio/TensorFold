@@ -126,3 +126,88 @@ test "other identities are swept, least recently opened first, until the cap fit
     try std.testing.expect(!exists(names[1]));
     try std.testing.expectEqual(@as(u64, 0), m.others);
 }
+
+test "reprobe takes each state's bytes and last use from its files; a state without files is dropped" {
+    const gpa = std.testing.allocator;
+    var tmp_buf: [256]u8 = undefined;
+    const root = try scratch(&tmp_buf, "reprobe");
+    defer rmTree(root);
+    const a = Imprint.keyOf(&.{ 1, 2 });
+    const b = Imprint.keyOf(&.{ 3, 4 });
+    var m = try Imprint.open(gpa, root, 1, 1 << 30);
+    defer m.deinit();
+    try m.add(a, 1, &.{ 1, 2 }, &.{}, 10); // the index says 10 bytes (an older build undercounted)
+    try m.add(b, 1, &.{ 3, 4 }, &.{}, 10);
+    var name: [64]u8 = undefined;
+    try fill(m.dir, try std.fmt.bufPrint(&name, "{x:0>16}.r0.bin", .{a}), 700); // the family's real file: 700 bytes
+    try std.testing.expectEqual(@as(u64, 700), m.diskBytes(a));
+    // b has no file
+    try std.testing.expectEqual(@as(usize, 1), try m.reprobe());
+    try std.testing.expect(m.has(a) and !m.has(b));
+    try std.testing.expectEqual(@as(u64, 700), m.total());
+    try m.rewrite();
+    var again = try Imprint.open(gpa, root, 1, 1 << 30);
+    defer again.deinit();
+    try std.testing.expectEqual(@as(u64, 700), again.total()); // the corrected bytes are in the index now
+}
+
+test "a state unread past the ttl expires; reading it moves its last use to now" {
+    const gpa = std.testing.allocator;
+    var tmp_buf: [256]u8 = undefined;
+    const root = try scratch(&tmp_buf, "ttl");
+    defer rmTree(root);
+    const a = Imprint.keyOf(&.{ 1, 2 });
+    const b = Imprint.keyOf(&.{ 3, 4 });
+    var m = try Imprint.open(gpa, root, 1, 1 << 30);
+    defer m.deinit();
+    m.ttl = 3600;
+    try m.add(a, 1, &.{ 1, 2 }, &.{}, 10);
+    try m.add(b, 1, &.{ 3, 4 }, &.{}, 10);
+    const now = imp.nowSeconds();
+    m.metas.items[0].last = now - 7200; // a: two hours unread
+    m.metas.items[1].last = now - 60;
+    const old = try m.expired(gpa, now);
+    defer gpa.free(old);
+    try std.testing.expectEqual(@as(usize, 1), old.len);
+    try std.testing.expectEqual(a, old[0]);
+    m.touch(a); // read now
+    const none = try m.expired(gpa, imp.nowSeconds());
+    defer gpa.free(none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+    m.ttl = 0; // no limit
+    m.metas.items[0].last = now - 999999;
+    const off = try m.expired(gpa, now);
+    defer gpa.free(off);
+    try std.testing.expectEqual(@as(usize, 0), off.len);
+}
+
+test "victims are the least recently used, enough to fit, never the kept one; removeMany rewrites once" {
+    const gpa = std.testing.allocator;
+    var tmp_buf: [256]u8 = undefined;
+    const root = try scratch(&tmp_buf, "victims");
+    defer rmTree(root);
+    const a = Imprint.keyOf(&.{ 1, 2 });
+    const b = Imprint.keyOf(&.{ 3, 4 });
+    const c = Imprint.keyOf(&.{ 5, 6 });
+    {
+        var m = try Imprint.open(gpa, root, 1, 100);
+        defer m.deinit();
+        try m.add(a, 1, &.{ 1, 2 }, &.{}, 40);
+        try m.add(b, 1, &.{ 3, 4 }, &.{}, 40);
+        try m.add(c, 1, &.{ 5, 6 }, &.{}, 10);
+        const none = try m.victims(gpa, 10, 0); // 90 + 10 fits 100
+        defer gpa.free(none);
+        try std.testing.expectEqual(@as(usize, 0), none.len);
+        m.setBytes(c, 80); // c's files turn out larger: 160 held
+        const v = try m.victims(gpa, 0, c); // a then b go; c is kept
+        defer gpa.free(v);
+        try std.testing.expectEqual(@as(usize, 2), v.len);
+        try std.testing.expectEqual(a, v[0]);
+        try std.testing.expectEqual(b, v[1]);
+        try m.removeMany(v);
+        try std.testing.expectEqual(@as(u64, 80), m.total());
+    }
+    var m = try Imprint.open(gpa, root, 1, 100);
+    defer m.deinit();
+    try std.testing.expect(!m.has(a) and !m.has(b) and m.has(c));
+}

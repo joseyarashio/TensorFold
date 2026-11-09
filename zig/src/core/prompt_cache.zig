@@ -82,6 +82,8 @@ pub const Store = struct {
     counts: Counts = .{},
     shared_keys: std.ArrayList(u64) = .empty, // the tokens of recently planned shared cuts, hashed (at most SHARED_KEYS)
     imprint: ?*imprint.Imprint = null, // --learn: shared cuts' states on disk, read back by later sessions and servers
+    last_expire: i64 = 0, // wall-clock seconds of the last ttl pass over the learned states
+    learned_forgotten: u64 = 0, // learned states forgotten (cap or ttl)
 
     const SHARED_KEYS = 64;
 
@@ -347,10 +349,52 @@ pub const Store = struct {
             if (!@import("builtin").is_test) std.log.warn("prompt cache: learn({d}) skipped (bytes {d} > cap {d})", .{ e.at, e.bytes, im.cap });
             return;
         }
-        while (!im.fits(e.bytes)) s.unlearn(im, im.victim() orelse return); // the least recently used go first
+        s.expireLearned(false);
+        s.forgetMany(im, im.victims(s.gpa, e.bytes, 0) catch &.{}); // the least recently used go first
         write(s.family.ptr, e.saved, im.dir, key) catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
         im.add(key, e.at, e.tokens, starts, e.bytes) catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
-        if (!@import("builtin").is_test) std.log.info("prompt cache: learned {d} tokens to disk ({s}/{x:0>16})", .{ e.at, im.dir, key });
+        // the family's files can hold more than `bytes` (DeepSeek's compressed plane grows with the position): the cap
+        // counts what is on disk, and makes room for it now
+        const real = im.diskBytes(key);
+        if (real > e.bytes) {
+            im.setBytes(key, real);
+            s.forgetMany(im, im.victims(s.gpa, 0, key) catch &.{});
+        }
+        if (!@import("builtin").is_test) std.log.info("prompt cache: learned {d} tokens to disk ({s}/{x:0>16}, {d} bytes)", .{ e.at, im.dir, key, @max(real, e.bytes) });
+    }
+
+    /// At startup, after the imprint is bound: its bytes and last uses taken from the files (an older index undercounts),
+    /// then states past the ttl and past the cap forgotten. Returns states (missing, expired, over cap).
+    pub fn settleLearned(s: *Store) struct { missing: usize, expired: usize, over_cap: usize } {
+        const im = s.imprint orelse return .{ .missing = 0, .expired = 0, .over_cap = 0 };
+        const missing = im.reprobe() catch 0;
+        if (missing > 0) im.rewrite() catch {};
+        const before = s.learned_forgotten;
+        s.expireLearned(true);
+        const expired_n = s.learned_forgotten - before;
+        s.forgetMany(im, im.victims(s.gpa, 0, 0) catch &.{});
+        return .{ .missing = missing, .expired = expired_n, .over_cap = s.learned_forgotten - before - expired_n };
+    }
+
+    /// Learned states `keys` forgotten together: their files (the family's), then one index rewrite. `keys` is freed.
+    fn forgetMany(s: *Store, im: *imprint.Imprint, keys: []const u64) void {
+        defer if (keys.len > 0) s.gpa.free(keys);
+        if (keys.len == 0) return;
+        if (s.family.vtable.forget) |f| for (keys) |k| f(s.family.ptr, im.dir, k);
+        im.removeMany(keys) catch |err| note("forgetting {d} learned states failed ({s})", .{ keys.len, @errorName(err) });
+        s.learned_forgotten += keys.len;
+    }
+
+    /// Learned states unread past the imprint's ttl forgotten (at most once a minute unless `now_`).
+    pub fn expireLearned(s: *Store, now_: bool) void {
+        const im = s.imprint orelse return;
+        if (im.ttl <= 0) return;
+        const now = imprint.nowSeconds();
+        if (!now_ and now - s.last_expire < 60) return;
+        s.last_expire = now;
+        const keys = im.expired(s.gpa, now) catch return;
+        if (keys.len > 0 and !@import("builtin").is_test) std.log.info("prompt cache: {d} learned states unread for over {d}s forgotten", .{ keys.len, im.ttl });
+        s.forgetMany(im, keys);
     }
 
     /// Learned state `key` forgotten: its files (the family's), then its index record.

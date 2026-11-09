@@ -417,8 +417,11 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
                 };
                 if (im) |*m| {
                     h.learned = m.*;
+                    // TF_LEARN_TTL_S: a learned state unread this many seconds is forgotten (unset or 0: no limit)
+                    if (getenv("TF_LEARN_TTL_S")) |v| h.learned.?.ttl = std.fmt.parseInt(i64, v, 10) catch 0;
                     h.cache.?.imprint = &h.learned.?;
-                    std.debug.print("[dsv41-debug] Imprint successfully bound to cache: dir={s}, metas={d}\n", .{ m.dir, m.metas.items.len });
+                    const settled = h.cache.?.settleLearned();
+                    std.debug.print("[dsv41-debug] Imprint bound: dir={s}, states={d}, disk={d:.2} GiB of cap {d:.2} GiB, ttl={d}s; dropped missing={d} expired={d} over_cap={d}\n", .{ h.learned.?.dir, h.learned.?.metas.items.len, @as(f64, @floatFromInt(h.learned.?.total())) / gib, @as(f64, @floatFromInt(h.learned.?.cap)) / gib, h.learned.?.ttl, settled.missing, settled.expired, settled.over_cap });
                 }
             } else {
                 std.debug.print("[dsv41-debug] o.learn is null in cuda.zig!\n", .{});

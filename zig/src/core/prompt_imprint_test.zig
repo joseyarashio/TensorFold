@@ -211,3 +211,31 @@ test "victims are the least recently used, enough to fit, never the kept one; re
     defer m.deinit();
     try std.testing.expect(!m.has(a) and !m.has(b) and m.has(c));
 }
+
+test "after reprobe the least recently used is the one whose files were used longest ago, not the first written" {
+    const gpa = std.testing.allocator;
+    var tmp_buf: [256]u8 = undefined;
+    const root = try scratch(&tmp_buf, "lru-restart");
+    defer rmTree(root);
+    const a = Imprint.keyOf(&.{ 1, 2 });
+    const b = Imprint.keyOf(&.{ 3, 4 });
+    var m = try Imprint.open(gpa, root, 1, 1000);
+    defer m.deinit();
+    try m.add(a, 1, &.{ 1, 2 }, &.{}, 10); // written first ...
+    try m.add(b, 1, &.{ 3, 4 }, &.{}, 10);
+    var name: [64]u8 = undefined;
+    var path: [512]u8 = undefined;
+    const now = imp.nowSeconds();
+    for ([_]struct { k: u64, ago: i64 }{ .{ .k = a, .ago = 10 }, .{ .k = b, .ago = 5000 } }) |x| {
+        const f = try std.fmt.bufPrint(&name, "{x:0>16}.r0.bin", .{x.k});
+        try fill(m.dir, f, 600);
+        const t_: std.c.timespec = .{ .sec = now - x.ago, .nsec = 0 };
+        const times = [2]std.c.timespec{ t_, t_ };
+        try std.testing.expectEqual(@as(c_int, 0), std.c.utimensat(std.os.linux.AT.FDCWD, try std.fmt.bufPrintSentinel(&path, "{s}/{s}", .{ m.dir, f }, 0), &times, 0));
+    }
+    _ = try m.reprobe(); // ... but a was read 10 s ago and b 5000 s ago
+    const v = try m.victims(gpa, 0, 0); // 1200 held over a cap of 1000: one goes
+    defer gpa.free(v);
+    try std.testing.expectEqual(@as(usize, 1), v.len);
+    try std.testing.expectEqual(b, v[0]);
+}

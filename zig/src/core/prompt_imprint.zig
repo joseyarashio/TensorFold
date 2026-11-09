@@ -79,6 +79,15 @@ pub const Imprint = struct {
                 gone += 1;
             }
         }
+        // the LRU order across a restart: the index is in write order, so rank by the files' last use instead
+        // (oldest first; ties keep write order), and the clock resumes past them
+        std.mem.sort(Meta, m.metas.items, {}, struct {
+            fn older(_: void, a: Meta, b: Meta) bool {
+                return a.last < b.last or (a.last == b.last and a.used < b.used);
+            }
+        }.older);
+        for (m.metas.items, 1..) |*x, n| x.used = n;
+        m.clock = m.metas.items.len;
         return gone;
     }
 

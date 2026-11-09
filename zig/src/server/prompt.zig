@@ -69,6 +69,11 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []
     var key: std.ArrayList(u32) = .empty;
     var placed: std.ArrayList(api.Image) = .empty;
     var history_extra: usize = 0;
+    // Each picture is prepared in this scratch, emptied before the next one, and only its payload is copied into the
+    // request's arena: decoding, resizing and patchifying take ~15 MiB a screenshot that an arena would hold until the
+    // request ends (a conversation that carries 200 screenshots took the head under memguard's floor).
+    var scratch: std.heap.ArenaAllocator = .init(srv.gpa);
+    defer scratch.deinit();
     for (ids, 0..) |id, i| {
         if (id != vision.token) {
             try out.append(cx.a, id);
@@ -78,14 +83,17 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []
         const k = placed.items.len;
         if (k >= images.len) return cx.refuse("image input: the prompt holds more image placeholders than images");
         var problem: []const u8 = "";
-        const prep = vision.prepare(vision.ctx, cx.a, images[k], &problem) catch |e| switch (e) {
+        _ = scratch.reset(.retain_capacity);
+        const prep = vision.prepare(vision.ctx, scratch.allocator(), images[k], &problem) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.BadImage => return cx.refuse(problem),
+            error.BadImage => return cx.refuse(try cx.a.dupe(u8, problem)),
         };
         if (prep.tokens == 0) return cx.refuse("image input: a picture gave no tokens");
-        try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
+        const payload = try cx.a.alignedAlloc(u8, .@"16", prep.payload.len);
+        @memcpy(payload, prep.payload);
+        try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = payload });
         try out.appendNTimes(cx.a, vision.token, prep.tokens);
-        try spellImage(cx.a, &key, prep.payload, prep.tokens);
+        try spellImage(cx.a, &key, payload, prep.tokens);
         if (i < history_len) history_extra += prep.tokens - 1;
     }
     if (placed.items.len != images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");

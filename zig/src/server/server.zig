@@ -273,7 +273,7 @@ pub const Server = struct {
         var arena: std.heap.ArenaAllocator = .init(srv.gpa);
         defer arena.deinit();
         while (true) {
-            _ = arena.reset(.retain_capacity);
+            _ = arena.reset(.{ .retain_with_limit = 1 << 20 });
             const a = arena.allocator();
             const outcome = conn.readRequest(a, true) catch break;
             switch (outcome) {
@@ -285,6 +285,7 @@ pub const Server = struct {
             if (conn.header("Expect")) |expect| if (std.ascii.eqlIgnoreCase(expect, "100-continue") and std.mem.order(u8, conn.version, "HTTP/1.1") != .lt) conn.sendContinue();
             routes.dispatch(srv, &conn, a);
             if (conn.close or conn.broken) break;
+            _ = arena.reset(.{ .retain_with_limit = 1 << 20 });
         }
     }
 

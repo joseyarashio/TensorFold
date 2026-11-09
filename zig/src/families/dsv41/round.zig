@@ -27,6 +27,7 @@ const exl3_experts2d = @import("exl3_experts2d.zig");
 const engram = @import("engram.zig");
 const exact = @import("exact.zig");
 const ops_mod = @import("ops.zig");
+const graph_cache = @import("graph_cache.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -842,29 +843,29 @@ const Carry = struct {
 /// arguments as the eager round, so the same bytes.
 pub const Graphs = struct {
     gpa: std.mem.Allocator,
-    map: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
+    lru: graph_cache.Lru(Key, Entry),
 
     pub const Key = struct { rows: u32, bucket: u64, stretch: u32 };
     const Entry = struct { exec: cuda.graph.Exec, start: Carry, end: Carry };
 
-    pub fn init(gpa: std.mem.Allocator) Graphs {
-        return .{ .gpa = gpa };
+    pub fn init(gpa: std.mem.Allocator, cap: usize) Graphs {
+        return .{ .gpa = gpa, .lru = .init(cap) };
     }
 
     pub fn deinit(g: *Graphs) void {
-        var it = g.map.valueIterator();
+        var it = g.lru.valueIterator();
         while (it.next()) |en| en.exec.deinit();
-        g.map.deinit(g.gpa);
+        g.lru.deinit(g.gpa);
         g.* = undefined;
     }
 
     /// The captured stretches.
     pub fn count(g: *const Graphs) usize {
-        return g.map.count();
+        return g.lru.count();
     }
 
     fn run(g: *Graphs, key: Key, e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, cy: *Carry, li: usize, end: usize) !void {
-        if (g.map.getPtr(key)) |en| {
+        if (g.lru.get(key)) |en| {
             if (!std.meta.eql(en.start, cy.*)) return error.GraphStateMismatch;
             try en.exec.launchOn(e.s);
             cy.* = en.end;
@@ -886,8 +887,12 @@ pub const Graphs = struct {
         defer graph.deinit();
         var exec = try graph.instantiate();
         errdefer exec.deinit();
-        try g.map.put(g.gpa, key, .{ .exec = exec, .start = start, .end = cy.* });
         try exec.launchOn(e.s);
+        if (try g.lru.put(g.gpa, key, .{ .exec = exec, .start = start, .end = cy.* })) |old| {
+            var x = old.exec;
+            x.deinit();
+            if (std.math.isPowerOfTwo(g.lru.evicted)) std.log.info("dsv41: CUDA graphs: {d} kept (the cap), {d} destroyed for newer ones so far; a count that keeps rising means TF_DS_GRAPH_CAP is below the working set", .{ g.lru.count(), g.lru.evicted });
+        } else if (std.math.isPowerOfTwo(g.lru.count()) and g.lru.count() >= 64) std.log.info("dsv41: CUDA graphs: {d} kept", .{g.lru.count()});
     }
 };
 

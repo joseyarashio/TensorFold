@@ -76,18 +76,10 @@ fn messages(cx: *Cx, value: ?Value, system: ?Value) errors.Refused!Value {
         try m.put(a, "content", .{ .string = joined.items });
         try out.append(a, .{ .object = m });
     };
-    for (list.array, 0..) |message, index| {
+    for (list.array) |message| {
         if (message != .object or !roleIs(message, &.{ "user", "assistant", "system" })) return cx.refuse("message role must be user, assistant or system");
         const role = message.get("role").?.string;
         if (std.mem.eql(u8, role, "system")) {
-            const previous: Value = if (index > 0) list.array[index - 1] else .{ .object = try json.newObject(a) };
-            const following: Value = if (index + 1 < list.array.len) list.array[index + 1] else blk: {
-                const f = try json.newObject(a);
-                try f.put(a, "role", .{ .string = "assistant" });
-                break :blk .{ .object = f };
-            };
-            if (previous != .object or !roleIs(previous, &.{ "user", "system" }) or following != .object or !roleIs(following, &.{ "assistant", "system" }))
-                return cx.refuse("mid-conversation system messages must follow a user turn and precede an assistant or end");
             const clear = message.get("clear_at");
             const clear_ok = clear == null or clear.? == .null or (clear.? == .string and std.mem.eql(u8, clear.?.string, "never"));
             if (!clear_ok or json.truthyField(message, "output_config")) return cx.refuse("turn-scoped system messages and per-message output_config are unsupported");
@@ -199,12 +191,15 @@ pub fn translate(cx: *Cx, body: Value, count: bool) errors.Refused!Value {
         try chat.put(a, "stop", stops);
     }
     if (body.field("context_management")) |context| {
-        const allowed = (try json.parse(a, "{\"type\": \"clear_thinking_20251015\", \"keep\": \"all\"}")).ok;
+        // Cloud tolerance: clients send any clear_thinking_<date> with keep all or none
+        // (issue: only 20251015+all was accepted, 400ing ZCode's mid-conversation messages).
         const edits = context.get("edits") orelse Value{ .array = &.{} };
         const ok = context == .object and edits == .array and for (edits.array) |e| {
-            if (!json.equal(e, allowed)) break false;
+            if (e != .object) break false;
+            const et = e.get("type") orelse Value.null;
+            if (et != .string or !std.mem.startsWith(u8, et.string, "clear_thinking_")) break false;
         } else true;
-        if (!ok) return cx.refuse("context_management supports clear_thinking with keep: all only");
+        if (!ok) return cx.refuse("context_management supports clear_thinking edits only");
     }
     for ([_][]const u8{ "container", "mcp_servers", "service_tier" }) |name| if (body.field(name)) |v| {
         const fine = (v == .array and v.array.len == 0) or (v == .string and std.mem.eql(u8, v.string, "auto"));
@@ -284,10 +279,14 @@ pub fn translate(cx: *Cx, body: Value, count: bool) errors.Refused!Value {
     try chat.put(a, "chat_template_kwargs", .{ .object = kwargs });
     if (!enabled) try chat.put(a, "reasoning_effort", .{ .string = "none" });
     if (std.mem.eql(u8, t, "enabled")) {
-        const budget = positiveInt(thinking.get("budget_tokens"));
-        const limit = if (body.get("max_tokens")) |m| m.int64() orelse std.math.maxInt(i64) else 0;
-        if (budget == null or (!count and budget.? >= limit)) return cx.refuse("thinking.budget_tokens must be positive and less than max_tokens");
-        try chat.put(a, "thinking_budget", thinking.get("budget_tokens").?);
+        // no budget_tokens (absent or null): the server's --thinking-budget default, as an OpenAI request without
+        // thinking_budget gets; one that is there is checked and passed on as before
+        if (thinking.get("budget_tokens")) |given| if (given != .null) {
+            const budget = positiveInt(given);
+            const limit = if (body.get("max_tokens")) |m| m.int64() orelse std.math.maxInt(i64) else 0;
+            if (budget == null or (!count and budget.? >= limit)) return cx.refuse("thinking.budget_tokens must be positive and less than max_tokens");
+            try chat.put(a, "thinking_budget", given);
+        };
     }
     return .{ .object = chat };
 }

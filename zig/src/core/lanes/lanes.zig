@@ -31,5 +31,8 @@ pub const SuffixLookup = proposer.SuffixLookup;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("engine_test.zig");
+    _ = @import("long_loop.zig");
+    _ = @import("long_loop_test.zig");
+    _ = @import("long_loop_backport_test.zig");
     _ = @import("gpu_full_test.zig");
 }

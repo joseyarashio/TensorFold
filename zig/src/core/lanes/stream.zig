@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const Proposer = @import("proposer.zig").Proposer;
 const Sampling = @import("sampling.zig").Sampling;
 const State = @import("depth.zig").State;
+const long_loop = @import("long_loop.zig");
 
 pub const Reason = enum {
     none,
@@ -52,7 +53,8 @@ pub fn loopCut(s: *const Stream, tokens: []const u32) ?usize {
     if (!s.loop_guard or !s.think_open or s.think_end < 0 or s.loop_period != null) return null;
     for (tokens, 0..) |token, i| {
         if (@as(i64, token) == s.think_end) return null;
-        if (cycleAt(s.emitted(), tokens, s.emitted().len + i + 1) != null) return i;
+        const n = s.emitted().len + i + 1;
+        if (cycleAt(s.emitted(), tokens, n) != null or s.long_loop.cycleAt(s.emitted(), tokens, n) != null) return i;
     }
     return null;
 }
@@ -156,6 +158,7 @@ pub const Stream = struct {
     think_open: bool,
     loop_guard: bool,
     loop_period: ?u32 = null,
+    long_loop: long_loop.Index = .{},
     chunks: []const u32,
     reuse: Reuse = .{},
     cut_in: u32 = 0,
@@ -222,6 +225,7 @@ pub const Stream = struct {
     pub fn deinit(s: *Stream, gpa: Allocator) void {
         s.context.deinit(gpa);
         s.force.deinit(gpa);
+        s.long_loop.deinit(gpa);
         s.dropRoundState(gpa);
     }
 
@@ -253,6 +257,14 @@ pub const Stream = struct {
 
     pub fn emitted(s: *const Stream) []const u32 {
         return s.context.items[s.prompt_len..];
+    }
+
+    /// Check the latest committed run, then index it without allocating after publication.
+    fn longCycle(s: *Stream) ?u32 {
+        const e = s.emitted();
+        const period = s.long_loop.cycleAt(e, &.{}, e.len);
+        s.long_loop.addAssumeCapacity(e);
+        return period;
     }
 
     pub fn budgetLeft(s: *const Stream) i64 {
@@ -311,13 +323,25 @@ pub const Stream = struct {
 
     /// Append tokens until the stream finishes; how many landed (a prefix of `tokens`).
     pub fn commit(s: *Stream, gpa: Allocator, tokens: []const u32) !usize {
+        // Backport 0ce409c: reserve before any token, gate, or forced-close state is published.
+        if (tokens.len > 0 and !s.finished and s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null) {
+            try s.context.ensureUnusedCapacity(gpa, tokens.len);
+            try s.force.ensureTotalCapacity(gpa, s.think_close.len);
+            var end: usize = 0;
+            for (tokens) |t| {
+                if (@as(i64, t) == s.think_end) break;
+                end += 1;
+            }
+            try s.long_loop.reserve(gpa, s.emitted().len + end);
+        }
         var landed: usize = 0;
         for (tokens) |t| {
             if (s.finished) break;
             try s.context.append(gpa, t);
             landed += 1;
             if (@as(i64, t) == s.think_end) s.think_open = false;
-            const fire = if (s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null) detectLoop(s.emitted()) else null;
+            const guarded = s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null;
+            const fire = if (guarded) detectLoop(s.emitted()) orelse s.longCycle() else null;
             if (s.isEos(t) or s.stopped()) {
                 s.finished = true;
                 s.reason = .stop;

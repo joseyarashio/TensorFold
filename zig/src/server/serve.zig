@@ -118,7 +118,8 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .enable_thinking = args.thinking,
         .reasoning_effort = args.reasoning_effort,
         .thinking_budget = args.thinking_budget,
-        .loop_guard = args.loop_guard,
+        .loop_guard = args.loop_guard or args.loop_guard_stop,
+        .loop_stop = args.loop_guard_stop,
         .drop_reasoning_history = args.drop_reasoning_history,
         .keep_last_n_reasoning = args.keep_last_n_reasoning,
         .keep_warm_s = args.keep_warm,
@@ -137,8 +138,8 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         return 1;
     };
     defer srv.deinit();
-    if (args.loop_guard and !srv.info.loop_guard) {
-        std.debug.print("tensorfold: --loop-guard is not supported by this native engine\n", .{});
+    if (srv.config.loop_guard and !srv.info.loop_guard) {
+        std.debug.print("tensorfold: {s} is not supported by this native engine\n", .{if (args.loop_guard_stop) "--loop-guard-stop" else "--loop-guard"});
         return 2;
     }
     if (raiseOpenFileLimit()) |r| log.line("open-file limit raised: soft {d} -> {d}", .{ r[0], r[1] });

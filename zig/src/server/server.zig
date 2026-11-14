@@ -39,6 +39,8 @@ pub const Config = struct {
     reasoning_effort: ?[]const u8 = null,
     thinking_budget: i64 = 0,
     loop_guard: bool = false,
+    /// --loop-guard-stop: a guarded reply ends where the guard fires, with a loop error and no answer or calls.
+    loop_stop: bool = false,
     /// The chat template sees no assistant turn's reasoning_content: a client that replays every turn's reasoning
     /// (DeepSeek-V4.1's template keeps it all once tools are present) no longer feeds the model its own earlier thinking.
     drop_reasoning_history: bool = false,

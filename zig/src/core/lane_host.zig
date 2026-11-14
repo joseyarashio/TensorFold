@@ -381,6 +381,7 @@ pub const LaneHost = struct {
             .think_close = r.think_close,
             .think_end = if (r.think_end) |t| t else -1,
             .loop_guard = r.loop_guard,
+            .loop_stop = r.loop_stop,
             .chunks = r.chunks,
             .reuse = reuse,
             .images = r.images,

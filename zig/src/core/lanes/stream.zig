@@ -136,6 +136,7 @@ pub const Spec = struct {
     think_end: i64 = -1,
     think_open: ?bool = null, // null: open when a budget is set (the server's rule)
     loop_guard: bool = false,
+    loop_stop: bool = false, // with loop_guard: finish where it fires instead of forcing the close
     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
     reuse: Reuse = .{},
     images: []const Image = &.{}, // in prompt order; the caller's until the stream is released
@@ -157,6 +158,7 @@ pub const Stream = struct {
     think_end: i64,
     think_open: bool,
     loop_guard: bool,
+    loop_stop: bool = false,
     loop_period: ?u32 = null,
     long_loop: long_loop.Index = .{},
     chunks: []const u32,
@@ -214,6 +216,7 @@ pub const Stream = struct {
             .think_end = spec.think_end,
             .think_open = spec.think_open orelse (spec.think_budget > 0 or (spec.loop_guard and spec.think_end >= 0)),
             .loop_guard = spec.loop_guard,
+            .loop_stop = spec.loop_stop,
             .chunks = spec.chunks,
             .reuse = spec.reuse,
             .images = spec.images,
@@ -350,7 +353,7 @@ pub const Stream = struct {
                 if (s.emitted().len >= s.max_new) {
                     s.finished = true;
                     s.reason = .length;
-                } else if (s.think_close.len == 0) {
+                } else if (s.think_close.len == 0 or s.loop_stop) {
                     s.finished = true;
                     s.reason = .stop;
                 } else {
@@ -395,6 +398,19 @@ test "loop guard stops at the cap even when no cycle fires" {
     defer guarded.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 10), try guarded.commit(gpa, &tokens));
     try std.testing.expect(guarded.finished and guarded.reason == .length);
+}
+
+test "loop guard stop policy finishes the stream at the fire and forces no close (--loop-guard-stop)" {
+    const gpa = std.testing.allocator;
+    var tokens: std.ArrayList(u32) = .empty;
+    defer tokens.deinit(gpa);
+    for (0..loop_warm_in) |i| try tokens.append(gpa, @intCast(1000 + i));
+    for (0..257) |_| try tokens.append(gpa, 7);
+    var s = try Stream.init(gpa, .{ .id = "loop", .prompt = &.{1}, .max_new = 400, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_guard = true, .loop_stop = true });
+    defer s.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 321), try s.commit(gpa, tokens.items));
+    try std.testing.expect(s.finished and s.reason == .stop and s.loop_period.? == 1 and s.force.items.len == 0);
+    try std.testing.expectEqual(@as(usize, 0), try s.commit(gpa, &.{8}));
 }
 
 test "loop guard fires, closes thinking, and latches once" {

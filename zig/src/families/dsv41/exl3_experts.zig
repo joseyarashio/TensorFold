@@ -23,6 +23,9 @@ pub const rows_rows_d = 32; // work list rows of grouped_rows: 16 * PROMPT_TILES
 pub const act_f32 = 1; // ACT_F32
 pub const prep_threads = 256; // experts.cu PREP_THREADS
 pub const decode_stages = 3; // DECODE_STAGES: each warp's ring of trellis copies in grouped_cp_kernel (its S)
+/// TF_DS_MOE_BUDGET on: a decode slot that is not routed (the budget's dropped slots, pick -1) adds 0, not the stale y it
+/// finds (store_y 0). Off (the served default) every decode slot is routed, so store_y never matters.
+pub var routed_only_y: bool = false;
 
 /// A K2 range's template: (8, 8), (2, 10) or (2, 16), as every grouped launcher picks it.
 pub fn range(lo: u32, hi: u32) usize {
@@ -393,7 +396,7 @@ pub fn decodeLaunches(ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride: 
     for ([_]u64{ sc.ids, sc.count, sc.members }) |v| prep.add(v);
     i32a(&prep, r); // maxm: the member lists' stride
     for ([_]u64{ wts, sc.y, 0, out }) |v| prep.add(v); // no add
-    for ([_]usize{ d, 1 }) |v| i32a(&prep, v); // store_y: a slot that is not routed adds the y it finds
+    for ([_]usize{ d, @intFromBool(!routed_only_y) }) |v| i32a(&prep, v); // store_y: a slot that is not routed adds the y it finds
     prep.add(sc.epoch);
     const prep_warps = prep_threads / 32;
     const blocks = 1 + (p * (d / 128) * 2 + prep_warps - 1) / prep_warps;
@@ -414,7 +417,7 @@ pub fn decodeLaunches(ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride: 
     var dn: cuda.Args = .{};
     for ([_]u64{ sc.xd, sc.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, sc.ids, sc.count, sc.members, sc.z }) |v| dn.add(v);
     for ([_]usize{ i, d, p, 1, r, slots }) |v| i32a(&dn, v);
-    dn.add(DecodeEpi{ .pick = pick, .E = @intCast(e), .svh_d = ex.svh_d, .y = sc.y, .wts = wts, .out = out, .cnt = sc.cnt_d, .ready = sc.ready, .ready_cnt = sc.ready_cnt, .epoch = sc.epoch, .discard = @intFromBool(4 * slots <= 32) });
+    dn.add(DecodeEpi{ .pick = pick, .E = @intCast(e), .svh_d = ex.svh_d, .y = sc.y, .wts = wts, .out = out, .store_y = @intFromBool(!routed_only_y), .cnt = sc.cnt_d, .ready = sc.ready, .ready_cnt = sc.ready_cnt, .epoch = sc.epoch, .discard = @intFromBool(4 * slots <= 32) });
 
     return .{
         .{ .kernel = .prep, .cfg = .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = prep_threads }, .shared = @intCast(2 * p * 4) }, .args = prep },

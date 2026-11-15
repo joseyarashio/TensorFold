@@ -37,6 +37,10 @@ pub const Ops = struct {
     copy16: cuda.Function,
     argmax_rows: cuda.Function,
     gpu_clock: cuda.Function,
+    ucount_acc: ?cuda.Function = null, // TF_DS_EXPERT_STATS (absent from older images)
+    xtime_begin: ?cuda.Function = null,
+    xtime_end: ?cuda.Function = null,
+    moe_budget: ?cuda.Function = null, // TF_DS_MOE_BUDGET
 
     /// The three images (cuda.kernels.torch_pointwise, torch_movement and dsv41_ops, or the fatbins' bytes).
     pub fn load(d: *const cuda.Driver, pointwise: []const u8, movement: []const u8, family: []const u8) !Ops {
@@ -68,6 +72,10 @@ pub const Ops = struct {
             .copy16 = try fm.function("tf_ds_copy_rows16_kernel"),
             .argmax_rows = try fm.function("tf_ds_argmax_rows_kernel"),
             .gpu_clock = try fm.function("tf_ds_clock_kernel"),
+            .ucount_acc = fm.function("tf_ds_ucount_acc_kernel") catch null,
+            .xtime_begin = fm.function("tf_ds_xtime_begin_kernel") catch null,
+            .xtime_end = fm.function("tf_ds_xtime_end_kernel") catch null,
+            .moe_budget = fm.function("tf_ds_moe_budget_kernel") catch null,
         };
     }
 
@@ -300,6 +308,48 @@ pub const Ops = struct {
         a.add(@as(u32, @intFromBool(reset)));
         a.add(cap);
         try go(o.gpu_clock, s, 1, 32, &a);
+    }
+
+    /// A measurement: stats[rows] += (1, ucount, ucount^2) from a decode window's distinct-expert count (one thread).
+    pub fn ucountAcc(o: *const Ops, s: cuda.Stream, ucount: u64, stats: u64, rows: usize) !void {
+        const f = o.ucount_acc orelse return error.MissingKernel;
+        var a: cuda.Args = .{};
+        a.add(ucount);
+        a.add(stats);
+        a.add(@as(c_int, @intCast(rows)));
+        try go(f, s, 1, 32, &a);
+    }
+
+    /// Budgeted expert selection of a verify round (dsv41_ops.cu tf_ds_moe_budget_kernel): pick / wts [rows, slots] in place.
+    pub fn moeBudget(o: *const Ops, s: cuda.Stream, pick: u64, wts: u64, row_slot: u64, rows: usize, slots: usize, topk: usize, experts: usize, keep: u32, cap: u32, min_streams: u32, stats: u64) !void {
+        const f = o.moe_budget orelse return error.MissingKernel;
+        var a: cuda.Args = .{};
+        a.add(pick);
+        a.add(wts);
+        a.add(row_slot);
+        for ([_]usize{ rows, slots, topk, experts }) |v| a.add(@as(c_int, @intCast(v)));
+        for ([_]u32{ keep, cap, min_streams }) |v| a.add(@as(c_int, @intCast(v)));
+        a.add(stats);
+        try go(f, s, 1, 512, &a);
+    }
+
+    /// A measurement: the GPU clock into t0 (before a decode window's experts).
+    pub fn xtimeBegin(o: *const Ops, s: cuda.Stream, t0: u64) !void {
+        const f = o.xtime_begin orelse return error.MissingKernel;
+        var a: cuda.Args = .{};
+        a.add(t0);
+        try go(f, s, 1, 32, &a);
+    }
+
+    /// A measurement: hist[rows][ucount] += (1, now - t0) (after a decode window's experts).
+    pub fn xtimeEnd(o: *const Ops, s: cuda.Stream, ucount: u64, t0: u64, hist: u64, rows: usize) !void {
+        const f = o.xtime_end orelse return error.MissingKernel;
+        var a: cuda.Args = .{};
+        a.add(ucount);
+        a.add(t0);
+        a.add(hist);
+        a.add(@as(c_int, @intCast(rows)));
+        try go(f, s, 1, 32, &a);
     }
 
     /// dst row i = src row idx[i] (int64 indices, rows of `bytes` bytes); an index outside [0, src_rows) sets the

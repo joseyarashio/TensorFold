@@ -197,6 +197,17 @@ pub const Round = struct {
     clk_marks: bool = false,
     clk_ratio: ?u8 = null, // phase clocks only in the layers of this compress ratio (TF_DS_CLOCK_MARKS=3: ratio 2)
     cur_ratio: u8 = 0, // the layer a stretch is on (its compress ratio) // clocks at every phase mark too (Model.useClock(true)), not only around the stretches
+    // TF_DS_EXPERT_STATS (a measurement, model.zig): per row count (calls, sum, sum^2) of the decode windows' distinct
+    // experts, u64 [max_rows + 1][3]; and each layer's picks and weights, [2][layers][max_rows][slots] (0: off)
+    xstats: u64 = 0,
+    xdump: u64 = 0,
+    xdump_half: usize = 0,
+    // TF_DS_MOE_BUDGET=keep:cap:min_streams (model.zig): the verify rounds' budgeted expert selection (cap 0: off)
+    moe_keep: u32 = 0,
+    moe_cap: u32 = 0,
+    moe_min_streams: u32 = 0,
+    moe_stats: u64 = 0, // TF_DS_MOE_STATS=1: u64 [8] in mapped host memory (tf_ds_moe_budget_kernel's stats)
+    xtime: u64 = 0, // TF_DS_EXPERT_STATS=3: u64 [1 + (max_rows + 1) * 128 * 2]: t0, then (count, ns) by rows, ucount
     clk: u64 = 0, // [1 + 2 * max_clocks] u64: the count, then each clock and its phase (PhaseTimer.Phase or clock_*)
 
     pub fn init(e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, pool_cap: usize) !Round {
@@ -220,6 +231,14 @@ pub const Round = struct {
         rd.clk_ratio = null;
         rd.cur_ratio = 0;
         rd.clk = 0;
+        rd.xstats = 0;
+        rd.xdump = 0;
+        rd.xdump_half = 0;
+        rd.xtime = 0;
+        rd.moe_keep = 0;
+        rd.moe_cap = 0;
+        rd.moe_min_streams = 0;
+        rd.moe_stats = 0;
         rd.bucket = 0;
         rd.has_cand = false;
         rd.kk = 0;
@@ -738,7 +757,11 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     const sl = e.slots();
     const kc = try tri_norm.rowmmGate(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, R, c.hidden, c.experts);
     try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
+    // the rows' pool slots: RoundDecoder.inputs' third row (setGlue)
+    // R is a graph key, so skipping rounds too small to hold min_streams streams is graph-safe (one row a stream at least)
+    if (rd.moe_cap != 0 and R >= rd.moe_min_streams) try e.ops.moeBudget(e.s, rd.pick, rd.mw, rd.inputs + 2 * R * 8, R, sl, c.top_k, c.experts, rd.moe_keep, rd.moe_cap, rd.moe_min_streams, rd.moe_stats);
     try rd.mark(e, .m_rt);
+    if (rd.xtime != 0) try e.ops.xtimeBegin(e.s, rd.xtime);
     if (e.two) |tw| {
         // 2D (round2d.experts, the profile's marks between): gate / up, the intermediate's exchange, down
         try exl3_experts2d.decodeGateUp(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
@@ -747,6 +770,14 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
         try rd.mark(e, .m_x);
         try exl3_experts2d.decodeDown(e.ex, e.s, lay.experts, ch.xsd, tw.xd_full, rd.pick, rd.mw, rd.pm, R);
     } else try exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
+    if (rd.xtime != 0) try e.ops.xtimeEnd(e.s, ch.xsd.count, rd.xtime, rd.xtime + 8, R);
+    if (rd.xstats != 0) try e.ops.ucountAcc(e.s, ch.xsd.count, rd.xstats, R);
+    if (rd.xdump != 0) {
+        const n = R * sl * 4;
+        const off = li * max_rows * sl * 4;
+        try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(rd.xdump + off, rd.pick, n, e.s.handle), "cuMemcpyDtoDAsync");
+        try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(rd.xdump + rd.xdump_half + off, rd.mw, n, e.s.handle), "cuMemcpyDtoDAsync");
+    }
     // the prefetch behind the experts: the next layer's attention mix and input linears (an Engram layer: the first
     // 4 MiB of its wkv), after the last layer the head
     if (li + 1 < e.w.layers.len) {

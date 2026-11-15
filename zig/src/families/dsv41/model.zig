@@ -142,6 +142,16 @@ pub const Model = struct {
     clk_rounds: u64 = 0,
     t_forward: u64 = 0,
     t_absorb: u64 = 0,
+    // TF_DS_EXPERT_STATS (a measurement, rank 0): 1 = each decode window's distinct experts by row count, 2 = also
+    // every verify round's picks and weights appended to a file (capped); mapped host memory the kernels write
+    xs_host: ?cuda.HostBuffer = null,
+    xd_host: ?cuda.HostBuffer = null,
+    xt_host: ?cuda.HostBuffer = null,
+    moe_stats_host: ?cuda.HostBuffer = null, // TF_DS_MOE_STATS=1
+    moe_rounds: u64 = 0,
+    xs_fd: c_int = -1,
+    xs_rounds: u64 = 0,
+    xs_dumped: u64 = 0,
     // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
     two: ?prompt2d.Two = null,
     rdma_rings: ?ring2d.Rings = null,
@@ -194,6 +204,14 @@ pub const Model = struct {
         m.pgraphs = null;
         m.two = null;
         m.rdma_rings = null;
+        m.xs_host = null;
+        m.xd_host = null;
+        m.xt_host = null;
+        m.moe_stats_host = null;
+        m.moe_rounds = 0;
+        m.xs_fd = -1;
+        m.xs_rounds = 0;
+        m.xs_dumped = 0;
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
         const c = &m.cfg;
@@ -299,6 +317,72 @@ pub const Model = struct {
         }
         m.rd = try round.Round.init(&m.eng, &m.arena, a, o.pool);
         m.amax = try m.arena.take(round.max_rows * 4);
+        exl3_experts.routed_only_y = false; // a module global: reset at every load, set only with the budget on
+        if (std.c.getenv("TF_DS_MOE_BUDGET")) |v| {
+            // keep:cap:min_streams, all three required, the same on every rank (checked below); verify rounds only
+            var it = std.mem.splitScalar(u8, std.mem.span(v), ':');
+            const keep = std.fmt.parseInt(u32, it.next() orelse "", 10) catch return error.BadMoeBudget;
+            const cap = std.fmt.parseInt(u32, it.next() orelse "", 10) catch return error.BadMoeBudget;
+            const min_streams = std.fmt.parseInt(u32, it.next() orelse "", 10) catch return error.BadMoeBudget;
+            if (it.next() != null) return error.BadMoeBudget;
+            if (keep == 0 or keep > c.top_k or cap == 0 or min_streams < 2) return error.BadMoeBudget;
+            // the kernel's shapes (it returns without writing past them): refuse rather than silently do nothing
+            if (round.max_rows > 64 or m.eng.slots() > 8 or c.experts > 512) return error.BadMoeBudget;
+            // the 2D split's expert path keeps store_y 1 (a dropped slot would add a stale y): not supported
+            if (m.two != null) return error.BadMoeBudget;
+            if (m.ops.moe_budget == null) return error.MissingKernel;
+            m.rd.moe_keep = keep;
+            m.rd.moe_cap = cap;
+            m.rd.moe_min_streams = min_streams;
+            exl3_experts.routed_only_y = true;
+            if (std.c.getenv("TF_DS_MOE_STATS")) |sv| if (std.mem.eql(u8, std.mem.span(sv), "1")) {
+                const hb = try cuda.HostBuffer.allocMapped(d, 8 * 8);
+                @memset(hb.bytes, 0);
+                m.moe_stats_host = hb;
+                m.rd.moe_stats = try hb.device();
+            };
+        }
+        {
+            // every rank must route alike: the settings gathered over NCCL and compared
+            const mine = [4]i32{ @intCast(m.rd.moe_keep), @intCast(m.rd.moe_cap), @intCast(m.rd.moe_min_streams), 0x4d4f4542 };
+            const sbuf = try m.arena.take(16);
+            const rbuf = try m.arena.take(16 * @as(usize, o.world));
+            try d.check(d.api.cuMemcpyHtoDAsync_v2(sbuf, &mine, 16, m.stream.handle), "cuMemcpyHtoDAsync");
+            try m.comm.allGather(sbuf, rbuf, 4, .i32, m.stream);
+            try m.stream.synchronize();
+            var all: [16]i32 = undefined;
+            try d.check(d.api.cuMemcpyDtoH_v2(&all, rbuf, 16 * @as(usize, o.world)), "cuMemcpyDtoH");
+            for (0..o.world) |r| if (!std.mem.eql(i32, all[4 * r ..][0..4], &mine)) {
+                std.log.err("TF_DS_MOE_BUDGET differs between ranks: rank {d} has {any}, this rank {any}", .{ r, all[4 * r ..][0..4], mine });
+                return error.MoeBudgetMismatch;
+            };
+            if (m.rd.moe_cap != 0) std.log.info("moe budget: keep {d}, cap {d}, from {d} streams (rank {d}; verify rounds only)", .{ m.rd.moe_keep, m.rd.moe_cap, m.rd.moe_min_streams, o.rank });
+        }
+        if (std.c.getenv("TF_DS_EXPERT_STATS")) |v| {
+            const mode = std.fmt.parseInt(u8, std.mem.span(v), 10) catch 0;
+            if (mode >= 1 and o.rank == 0 and m.ops.ucount_acc != null) {
+                const hb = try cuda.HostBuffer.allocMapped(d, (round.max_rows + 1) * 3 * 8);
+                @memset(hb.bytes, 0);
+                m.xs_host = hb;
+                m.rd.xstats = try hb.device();
+                if (mode == 3) {
+                    // timing alone (no dump, so the copies do not skew it): GPU time of the experts by rows and ucount
+                    const ht = try cuda.HostBuffer.allocMapped(d, (1 + (round.max_rows + 1) * 128 * 2) * 8);
+                    @memset(ht.bytes, 0);
+                    m.xt_host = ht;
+                    m.rd.xtime = try ht.device();
+                } else if (mode >= 2) {
+                    const xhalf = c.layers * round.max_rows * m.eng.slots() * 4;
+                    const hd = try cuda.HostBuffer.allocMapped(d, 2 * xhalf);
+                    @memset(hd.bytes, 0);
+                    m.xd_host = hd;
+                    m.rd.xdump = try hd.device();
+                    m.rd.xdump_half = xhalf;
+                    m.xs_fd = std.c.open("/home/joseyarashio/.cache/dsv41-expert-stats/rounds.bin", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+                }
+                std.log.info("expert stats: on (mode {d}, layers {d}, slots {d})", .{ mode, c.layers, m.eng.slots() });
+            }
+        }
         if (o.graphs) m.graphs = round.Graphs.init(gpa, o.graph_cap);
         if (o.side) try m.rd.useSide(&m.eng);
         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
@@ -820,6 +904,80 @@ pub const Model = struct {
         }
         try m.stream.synchronize();
         if (m.prof) m.t_absorb = m.now() - t1;
+        if (m.xs_host != null) m.expertStats(rows);
+        if (m.moe_stats_host) |hb| {
+            m.moe_rounds += 1;
+            if (m.moe_rounds % 64 == 0) {
+                const st = std.mem.bytesAsSlice(u64, hb.bytes);
+                var out: [512]u8 = undefined;
+                const line = std.fmt.bufPrint(&out, "{{\"rank\": {d}, \"rounds\": {d}, \"calls\": {d}, \"fired\": {d}, \"sum_streams\": {d}, \"sum_union_before\": {d}, \"sum_union_after\": {d}, \"dropped_slots\": {d}, \"dropped_weight_e6\": {d}, \"max_rescale_e6\": {d}}}\n", .{ m.rank, m.moe_rounds, st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7] }) catch return;
+                var pb: [128]u8 = undefined;
+                const path = std.fmt.bufPrintSentinel(&pb, "/home/joseyarashio/.cache/dsv41-expert-stats/moe_budget.r{d}.json", .{m.rank}, 0) catch return;
+                var tb: [136]u8 = undefined;
+                const tmp = std.fmt.bufPrintSentinel(&tb, "{s}.part", .{path}, 0) catch return;
+                const fd = std.c.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+                if (fd < 0) return;
+                _ = std.c.write(fd, line.ptr, line.len);
+                _ = std.c.close(fd);
+                _ = std.c.rename(tmp, path);
+            }
+        }
+    }
+
+    /// TF_DS_EXPERT_STATS: every 256 rounds the stats file; with mode 2 this round's picks and weights appended
+    /// (header: magic, rows, layers, slots, windows; each row's stream slot; picks i32 [layers][rows][slots]; weights f32
+    /// the same), until 2 GiB.
+    fn expertStats(m: *Model, rows: round.Rows) void {
+        m.xs_rounds += 1;
+        const R = rows.ids.len;
+        if (m.xs_fd >= 0 and m.xd_host != null and m.xs_dumped < (2 << 30)) {
+            const sl = m.eng.slots();
+            const L = m.w.layers.len;
+            const nw: u32 = if (rows.windows) |w| @intCast(w.len) else 1;
+            const hdr: [8]u32 = .{ 0x58535431, @intCast(R), @intCast(L), @intCast(sl), nw, 0, 0, 0 };
+            var slots_buf: [round.max_rows]i32 = @splat(0);
+            for (0..R) |i| slots_buf[i] = if (rows.slots) |s| @intCast(s[i]) else 0;
+            const hb = m.xd_host.?.bytes;
+            const half = m.rd.xdump_half;
+            var n: usize = 0;
+            n += @intCast(@max(0, std.c.write(m.xs_fd, std.mem.asBytes(&hdr).ptr, 32)));
+            n += @intCast(@max(0, std.c.write(m.xs_fd, std.mem.sliceAsBytes(slots_buf[0..R]).ptr, R * 4)));
+            for (0..2) |part| for (0..L) |li| {
+                const off = part * half + li * round.max_rows * sl * 4;
+                n += @intCast(@max(0, std.c.write(m.xs_fd, hb[off..].ptr, R * sl * 4)));
+            };
+            m.xs_dumped += n;
+        }
+        if (m.xs_rounds % 256 != 0) return;
+        const st = std.mem.bytesAsSlice(u64, m.xs_host.?.bytes);
+        var out: [131072]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        w.print("{{\"rounds\": {d}, \"by_rows\": {{", .{m.xs_rounds}) catch return;
+        var first = true;
+        for (0..round.max_rows + 1) |r| {
+            if (st[3 * r] == 0) continue;
+            w.print("{s}\"{d}\": [{d}, {d}, {d}]", .{ if (first) "" else ", ", r, st[3 * r], st[3 * r + 1], st[3 * r + 2] }) catch return;
+            first = false;
+        }
+        w.print("}}", .{}) catch return;
+        if (m.xt_host) |ht| {
+            const tt = std.mem.bytesAsSlice(u64, ht.bytes);
+            w.print(", \"xtime\": [", .{}) catch return;
+            var f2 = true;
+            for (0..round.max_rows + 1) |r| for (0..128) |u| {
+                const o = 1 + (r * 128 + u) * 2;
+                if (tt[o] == 0) continue;
+                w.print("{s}[{d}, {d}, {d}, {d}]", .{ if (f2) "" else ", ", r, u, tt[o], tt[o + 1] }) catch return;
+                f2 = false;
+            };
+            w.print("]", .{}) catch return;
+        }
+        w.print("}}\n", .{}) catch return;
+        const fd = std.c.open("/home/joseyarashio/.cache/dsv41-expert-stats/stats.json.part", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        if (fd < 0) return;
+        _ = std.c.write(fd, w.buffered().ptr, w.buffered().len);
+        _ = std.c.close(fd);
+        _ = std.c.rename("/home/joseyarashio/.cache/dsv41-expert-stats/stats.json.part", "/home/joseyarashio/.cache/dsv41-expert-stats/stats.json");
     }
 
     /// The rounds' GPU clocks (a profile): the forward's start and each stretch's ends, for its gaps.
